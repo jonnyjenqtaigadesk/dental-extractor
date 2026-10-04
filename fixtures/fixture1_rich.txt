@@ -1,0 +1,29 @@
+FAKE SAMPLE - NOT A REAL PLAN
+Plan name: Northwind Example Dental
+
+This is a PPO plan.
+
+In-Network    Out-of-Network
+
+Annual maximum
+Per person annual maximum: $1,500
+
+Deductible
+Annual deductible per person: $50
+Family deductible maximum: $150
+Deductible waived for diagnostic and preventive services.
+
+Orthodontics
+Orthodontic lifetime maximum: $1,000 for children only.
+
+Plan pay by class
+Diagnostic and Preventive    100%    80%
+Basic    80%    60%
+Major Restorative    50%    40%
+
+Waiting periods
+Major Restorative: 12-month waiting period.
+
+Frequencies
+Cleanings: 2 per year
+Crowns: 1 every 5 years

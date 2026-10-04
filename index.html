@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Dental benefit summary extractor</title>
+  <style>
+    :root { color-scheme: light dark; }
+    body {
+      margin: 0 auto;
+      max-width: 52rem;
+      padding: 1.5rem 1.25rem 3rem;
+      font: 16px/1.45 system-ui, sans-serif;
+    }
+    h1 { font-size: 1.45rem; line-height: 1.25; margin-bottom: 0.25rem; }
+    p, li { max-width: 48rem; }
+    .note {
+      background: Canvas;
+      border: 1px solid color-mix(in srgb, CanvasText 25%, transparent);
+      border-radius: 6px;
+      padding: 0.75rem 0.9rem;
+    }
+    label { display: block; font-weight: 600; margin-top: 1rem; }
+    textarea, input[type="file"] { width: 100%; box-sizing: border-box; margin-top: 0.35rem; }
+    textarea { min-height: 12rem; font: 0.9rem/1.4 ui-monospace, monospace; }
+    button {
+      margin-top: 0.9rem;
+      font: inherit;
+      padding: 0.4rem 0.9rem;
+    }
+    pre {
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      font: 0.85rem/1.4 ui-monospace, monospace;
+      border: 1px solid color-mix(in srgb, CanvasText 20%, transparent);
+      border-radius: 6px;
+      padding: 0.75rem;
+    }
+    .status { min-height: 1.4em; margin-top: 0.75rem; }
+    .error { color: #9b1c1c; }
+    h2 { font-size: 1.05rem; margin-top: 1.4rem; }
+  </style>
+</head>
+<body>
+  <h1>Dental benefit summary extractor</h1>
+  <p>Unofficial. Does not invent values. The parser is <a href="extract.py">extract.py</a> from this site, loaded unchanged and run in your browser with <a href="https://pyodide.org/">Pyodide</a>. Nothing is sent to a server.</p>
+  <p class="note">A PDF on this hosted page is read by the browser, not by pdftotext, so the words can differ from the CLI even though the parser file is the same. Pasted text and a .txt upload are not read by PDF.js. They are passed straight to <code>extract_text</code>.</p>
+
+  <label for="summary">Paste summary text</label>
+  <textarea id="summary" spellcheck="false" placeholder="Paste a dental benefit summary here"></textarea>
+
+  <label for="file">Or upload a .txt or .pdf file</label>
+  <input id="file" type="file" accept=".txt,.pdf,text/plain,application/pdf">
+  <p>If a file is selected, it is used instead of the paste box. Clear the file choice to use pasted text.</p>
+
+  <button id="run" type="button">Extract</button>
+  <button id="clear-file" type="button">Clear file</button>
+  <p id="status" class="status" role="status"></p>
+
+  <h2>readable_summary</h2>
+  <pre id="summary-out"></pre>
+  <h2>JSON</h2>
+  <pre id="json-out"></pre>
+  <h2>Text passed to extract_text</h2>
+  <pre id="text-out"></pre>
+
+  <script src="https://cdn.jsdelivr.net/pyodide/v314.0.7/full/pyodide.js"></script>
+  <script src="page.js"></script>
+</body>
+</html>
