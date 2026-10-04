@@ -1,8 +1,8 @@
 # Dental benefit summary extractor
 
-Local CLI for other agents. It reads a pasted text summary or a text-based PDF and returns one JSON object. Every benefit value is either quoted from the document or explicitly `not_found`. It does not invent numbers, percents, ages, waiting periods, class mappings, or yes/no answers.
+Local CLI for other agents. It reads a pasted text summary or a PDF and returns one JSON object. Every benefit value is either quoted from the text that was parsed or explicitly `not_found`. It does not invent numbers, percents, ages, waiting periods, class mappings, or yes/no answers.
 
-No network. No API keys. No pip installs. Python 3 standard library plus the `pdftotext` binary from poppler.
+No network. No API keys. No pip installs. No vision-model API. Python 3 standard library plus the `pdftoppm` binary from poppler and the `tesseract` binary.
 
 ## How to run
 
@@ -15,15 +15,18 @@ python3 /workspace/dental-extractor/extract.py -
 python3 /workspace/dental-extractor/test_extract.py
 ```
 
-Stdout is one JSON object (`ok`, `source`, `fields`, `notes`, `readable_summary`). `notes` is a list of short verbatim evidence snippets. There is no HTML page; the CLI is the interface.
+Stdout is one JSON object (`ok`, `source`, `fields`, `notes`, `readable_summary`). `notes` is a list of short verbatim evidence snippets. For a PDF, `source.kind` is `pdf-image-ocr` and `source.pages` is the number of rendered pages.
 
-PDF input is read only by running:
+A PDF is not read from its text layer. Each page is rendered to a PNG, then Tesseract OCRs those images, and that string is passed to `extract_text`:
 
 ```bash
-pdftotext -layout -enc UTF-8 <file.pdf> -
+pdftoppm -png -r 200 <file.pdf> <prefix>
+tesseract <prefix>-1.png stdout -l eng
 ```
 
-If `pdftotext` fails, the process exits non-zero and prints `{"ok": false, "error": "..."}`. It does not guess the plan.
+Page texts are joined with a blank line. If rendering or Tesseract fails, the process exits non-zero and prints `{"ok": false, "error": "..."}`. It does not guess the plan. If OCR returns no text, benefits stay `not_found` and `warnings` says OCR returned no text.
+
+Pasted text, stdin, and `--text` go straight to `extract_text`. They are not OCR'd.
 
 ## No-invent rule
 
@@ -39,7 +42,7 @@ or:
 {"status": "not_found", "value": null, "evidence": null}
 ```
 
-`status: found` requires `evidence` to be an exact substring of the text after PDF extraction. If it cannot be quoted, the leaf is `not_found` and `value` is null. A number in `value` must appear in that quote. Words such as "eighty percent" are not rewritten as 80. An absent slot is empty. It is not filled from general dental knowledge, and it is not stored as `false`.
+`status: found` requires `evidence` to be an exact substring of the text passed to `extract_text`. For a PDF, that text is the Tesseract OCR of the rendered page images. If it cannot be quoted, the leaf is `not_found` and `value` is null. A number in `value` must appear in that quote. Words such as "eighty percent" are not rewritten as 80. An absent slot is empty. It is not filled from general dental knowledge, and it is not stored as `false`.
 
 If the document waives the deductible for preventive only, the orthodontic waiver stays `not_found`. If it says orthodontics is for children only, adult eligibility stays `not_found` unless adult eligibility is also printed. If it never mentions waiting periods, the waiting-period collection is `not_found`. It is not a grid of zeros.
 
@@ -100,8 +103,9 @@ A crown is not Major, and a procedure is not moved into a class, unless the docu
 
 ## Limitations
 
-- Works on text-based PDFs. Scanned image PDFs are not OCR'd. If `pdftotext` returns no text, benefits stay `not_found` and a warning is included. Failure of `pdftotext` is an error, not a guess.
-- Multi-column summaries depend on `pdftotext -layout`. Wrapped lines can split an age or a frequency away from its procedure; those leaves stay `not_found` instead of being inferred.
+- A PDF is rendered to page images with `pdftoppm`, then Tesseract reads those images. The PDF text layer is not used. This is OCR, not a vision LLM. If a field is not in the OCR text, it stays `not_found`.
+- If rendering or Tesseract fails, the process exits non-zero with an error JSON and no guessed benefits. If OCR returns no text, benefits stay `not_found` and a warning is included.
+- OCR can misread a column, a percent, or a dollar amount. Wrapped lines can split an age or a frequency away from its procedure. Those leaves stay `not_found` instead of being inferred.
 - Ambiguous rows (percent count does not match the network columns) are skipped.
 - This tool does not import or depend on `/workspace/taigadesk/`.
 
@@ -109,4 +113,6 @@ A crown is not Major, and a procedure is not moved into a class, unless the docu
 
 A browser page is published with GitHub Pages: <https://jonnyjenqtaigadesk.github.io/dental-extractor/>.
 
-Paste a summary or upload a `.txt` file. The page loads this repo's `extract.py` from the same site and runs the unchanged `extract_text` function in the browser with Pyodide. It does not rewrite the parser. A PDF upload is read in the browser with PDF.js, not with `pdftotext`, so the words can differ from the CLI even though the parser file is the same. A `.txt` upload and pasted text do not go through PDF.js. There is no backend and no API key.
+Paste a summary or upload a `.txt` or `.pdf` file. The page loads this repo's `extract.py` from the same site and runs the unchanged `extract_text` function in the browser with Pyodide. It does not rewrite the parser.
+
+A PDF is rendered to page images first. Tesseract.js (pinned from a CDN) then reads those images. That is OCR, not a vision LLM, and it does not read the PDF text layer. The page shows the page images, the OCR text that was parsed, `readable_summary`, and the JSON. Pasted text and a `.txt` upload are not OCR'd and do not use PDF.js. There is no backend and no API key.

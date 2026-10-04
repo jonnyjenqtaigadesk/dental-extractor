@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Extract dental plan-design fields from a summary.
 
-Pure Python 3 plus pdftotext. Every benefit leaf is found only when a
-verbatim evidence quote is a substring of the source. Nothing is filled
-from general dental knowledge.
+Pure Python 3. A PDF is rendered to page images with pdftoppm, then those
+images are read with the tesseract binary. extract_text sees that OCR text.
+This is not a vision LLM. Every benefit leaf is found only when a
+verbatim evidence quote is a substring of the source text. Nothing is
+filled from general dental knowledge.
 
 NADP class names (Class I / II / III) are NOT used as defaults.
 """
@@ -15,6 +17,8 @@ import json
 import re
 import subprocess
 import sys
+import tempfile
+from pathlib import Path
 from typing import Any
 
 Leaf = dict[str, Any]
@@ -806,22 +810,52 @@ def extract_text(text: str) -> dict[str, Any]:
     }
 
 
-def pdf_to_text(path: str) -> tuple[str | None, str | None]:
-    try:
-        proc = subprocess.run(
-            ["pdftotext", "-layout", "-enc", "UTF-8", path, "-"],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            check=False,
+def pdf_to_text(path: str) -> tuple[str | None, str | None, int | None]:
+    """Render each page to a PNG, then OCR those images.
+
+    Returns (text, error, page_count). Page texts are joined with a blank
+    line. The PDF text layer is not read. Empty OCR text is not an error.
+    """
+    with tempfile.TemporaryDirectory(prefix="dental-ocr-") as tmp:
+        prefix = str(Path(tmp) / "page")
+        try:
+            render = subprocess.run(
+                ["pdftoppm", "-png", "-r", "200", path, prefix],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+            )
+        except FileNotFoundError:
+            return None, "pdftoppm is not installed", None
+        if render.returncode != 0:
+            detail = (render.stderr or render.stdout or "pdftoppm failed").strip()
+            return None, f"pdftoppm failed: {detail}", None
+        pages = sorted(
+            Path(tmp).glob("page-*.png"),
+            key=lambda image: int(image.stem.rsplit("-", 1)[-1]),
         )
-    except FileNotFoundError:
-        return None, "pdftotext is not installed"
-    if proc.returncode != 0:
-        detail = (proc.stderr or proc.stdout or "pdftotext failed").strip()
-        return None, f"pdftotext failed: {detail}"
-    return proc.stdout, None
+        if not pages:
+            return None, "pdftoppm produced no page images", None
+        texts: list[str] = []
+        for image in pages:
+            try:
+                ocr = subprocess.run(
+                    ["tesseract", str(image), "stdout", "-l", "eng"],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    check=False,
+                )
+            except FileNotFoundError:
+                return None, "tesseract is not installed", None
+            if ocr.returncode != 0:
+                detail = (ocr.stderr or ocr.stdout or "tesseract failed").strip()
+                return None, f"tesseract failed: {detail}", None
+            texts.append(ocr.stdout.rstrip("\n"))
+        return "\n\n".join(texts), None, len(pages)
 
 
 def emit(payload: dict[str, Any]) -> None:
@@ -854,16 +888,18 @@ def run(argv: list[str] | None = None) -> int:
             result = extract_text(text)
             result["source"] = {"kind": "stdin", "name": None}
         elif args.file.lower().endswith(".pdf"):
-            text, err = pdf_to_text(args.file)
+            text, err, page_count = pdf_to_text(args.file)
             if err:
-                emit(error_payload(err, "pdf", args.file))
+                emit(error_payload(err, "pdf-image-ocr", args.file))
                 return 1
             result = extract_text(text or "")
-            result["source"] = {"kind": "pdf", "name": args.file}
+            result["source"] = {
+                "kind": "pdf-image-ocr",
+                "name": args.file,
+                "pages": page_count,
+            }
             if not (text or "").strip():
-                result["warnings"] = [
-                    "pdftotext returned no text; scanned image PDFs are not supported"
-                ]
+                result["warnings"] = ["OCR returned no text"]
         else:
             text = read_text_file(args.file)
             result = extract_text(text)

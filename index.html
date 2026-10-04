@@ -39,12 +39,20 @@
     .status { min-height: 1.4em; margin-top: 0.75rem; }
     .error { color: #9b1c1c; }
     h2 { font-size: 1.05rem; margin-top: 1.4rem; }
+    .pages figure { margin: 0.75rem 0; }
+    .pages canvas {
+      display: block;
+      max-width: 100%;
+      height: auto;
+      border: 1px solid color-mix(in srgb, CanvasText 20%, transparent);
+      background: #fff;
+    }
   </style>
 </head>
 <body>
   <h1>Dental benefit summary extractor</h1>
   <p>Unofficial. Does not invent values. The parser is <a href="extract.py">extract.py</a> from this site, loaded unchanged and run in your browser with <a href="https://pyodide.org/">Pyodide</a>. Nothing is sent to a server.</p>
-  <p class="note">A PDF on this hosted page is read by the browser, not by pdftotext, so the words can differ from the CLI even though the parser file is the same. Pasted text and a .txt upload are not read by PDF.js. They are passed straight to <code>extract_text</code>.</p>
+  <p class="note">Pages are rendered to images first, then Tesseract reads those images. That is OCR, not a vision LLM, and it is not the PDF text layer. Pasted text and a .txt upload are not OCR'd. They go straight to <code>extract_text</code>.</p>
 
   <label for="summary">Paste summary text</label>
   <textarea id="summary" spellcheck="false" placeholder="Paste a dental benefit summary here"></textarea>
@@ -61,6 +69,8 @@
   <pre id="summary-out"></pre>
   <h2>JSON</h2>
   <pre id="json-out"></pre>
+  <h2>Page images</h2>
+  <div id="pages" class="pages"></div>
   <h2>Text passed to extract_text</h2>
   <pre id="text-out"></pre>
 

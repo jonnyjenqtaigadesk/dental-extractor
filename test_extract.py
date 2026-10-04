@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -262,7 +263,9 @@ class EvidenceTests(unittest.TestCase):
         source = (ROOT / "extract.py").read_text(encoding="utf-8")
         for banned in ("urllib", "requests", "http.client", "socket", "pip "):
             self.assertNotIn(banned, source)
-        self.assertIn("pdftotext", source)
+        self.assertIn("pdftoppm", source)
+        self.assertIn("tesseract", source)
+        self.assertNotIn("pdftotext", source)
         self.assertIn("subprocess", source)
 
 
@@ -304,7 +307,7 @@ class CliTests(unittest.TestCase):
             [],
         )
 
-    def test_pdf_uses_pdftotext(self):
+    def test_pdf_uses_pdftoppm_and_tesseract_not_pdftotext(self):
         lines = [
             "This is a PPO plan.",
             "Per person annual maximum: $1,500",
@@ -312,26 +315,35 @@ class CliTests(unittest.TestCase):
             "Diagnostic and Preventive    100%    80%",
         ]
         with tempfile.TemporaryDirectory() as tmp:
-            pdf_path = Path(tmp) / "sample.pdf"
+            tmp_path = Path(tmp)
+            pdf_path = tmp_path / "sample.pdf"
             pdf_path.write_bytes(build_pdf(lines))
+            bin_dir = tmp_path / "bin"
+            bin_dir.mkdir()
+            fake = bin_dir / "pdftotext"
+            fake.write_text("#!/bin/sh\necho pdftotext-should-not-run >&2\nexit 99\n", encoding="utf-8")
+            fake.chmod(0o755)
+            env = os.environ.copy()
+            env["PATH"] = str(bin_dir) + os.pathsep + env.get("PATH", "")
             proc = subprocess.run(
                 [sys.executable, str(ROOT / "extract.py"), str(pdf_path)],
                 capture_output=True,
                 text=True,
                 check=False,
+                env=env,
             )
-            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            self.assertNotIn("pdftotext-should-not-run", proc.stderr)
             payload = json.loads(proc.stdout)
-            self.assertEqual(payload["source"]["kind"], "pdf")
-            text_proc = subprocess.run(
-                ["pdftotext", "-layout", "-enc", "UTF-8", str(pdf_path), "-"],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            self.assertEqual(text_proc.returncode, 0, text_proc.stderr)
-            source = text_proc.stdout
-            assert_leaf_rules(self, source, payload["fields"])
+            self.assertTrue(payload["ok"])
+            self.assertEqual(payload["source"]["kind"], "pdf-image-ocr")
+            self.assertEqual(payload["source"]["pages"], 1)
+            ocr_text, err, pages = extract.pdf_to_text(str(pdf_path))
+            self.assertIsNone(err)
+            self.assertEqual(pages, 1)
+            self.assertTrue(ocr_text)
+            assert_leaf_rules(self, ocr_text, payload["fields"])
+            self.assertEqual(payload["fields"], extract.extract_text(ocr_text)["fields"])
             self.assertEqual(payload["fields"]["plan_type"]["value"], "PPO")
             self.assertEqual(
                 payload["fields"]["annual_or_contract_maximum"]["amount_per_person"]["value"],
@@ -355,7 +367,8 @@ class CliTests(unittest.TestCase):
             self.assertNotEqual(proc.returncode, 0)
             payload = json.loads(proc.stdout)
             self.assertFalse(payload["ok"])
-            self.assertIn("pdftotext", payload["error"])
+            self.assertIn("pdftoppm", payload["error"])
+            self.assertNotIn("pdftotext", payload["error"])
 
     def test_missing_file_is_json_error(self):
         proc = subprocess.run(
