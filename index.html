@@ -13,7 +13,7 @@
       font: 16px/1.45 system-ui, sans-serif;
     }
     h1 { font-size: 1.45rem; line-height: 1.25; margin-bottom: 0.25rem; }
-    p, li { max-width: 48rem; }
+    p { max-width: 48rem; }
     .note {
       background: Canvas;
       border: 1px solid color-mix(in srgb, CanvasText 25%, transparent);
@@ -21,20 +21,11 @@
       padding: 0.75rem 0.9rem;
     }
     label { display: block; font-weight: 600; margin-top: 1rem; }
-    textarea, input[type="file"] { width: 100%; box-sizing: border-box; margin-top: 0.35rem; }
-    textarea { min-height: 12rem; font: 0.9rem/1.4 ui-monospace, monospace; }
+    input[type="file"] { width: 100%; box-sizing: border-box; margin-top: 0.35rem; }
     button {
       margin-top: 0.9rem;
       font: inherit;
       padding: 0.4rem 0.9rem;
-    }
-    pre {
-      white-space: pre-wrap;
-      overflow-wrap: anywhere;
-      font: 0.85rem/1.4 ui-monospace, monospace;
-      border: 1px solid color-mix(in srgb, CanvasText 20%, transparent);
-      border-radius: 6px;
-      padding: 0.75rem;
     }
     .status { min-height: 1.4em; margin-top: 0.75rem; }
     .error { color: #9b1c1c; }
@@ -51,30 +42,19 @@
 </head>
 <body>
   <h1>Dental benefit summary extractor</h1>
-  <p>Unofficial. Does not invent values. The parser is <a href="extract.py">extract.py</a> from this site, loaded unchanged and run in your browser with <a href="https://pyodide.org/">Pyodide</a>. Nothing is sent to a server.</p>
-  <p class="note">OCR removed. Images stay on the page. Gemini runs in the CLI, not in the browser. Pasted text and a .txt upload still go straight to <code>extract_text</code>.</p>
+  <p>Unofficial. Results are CLI only. Nothing is extracted in the browser.</p>
+  <p class="note">Nothing is extracted in the browser. This page only renders PDF page images. It does not read benefits and it does not send the file anywhere.</p>
 
-  <label for="summary">Paste summary text</label>
-  <textarea id="summary" spellcheck="false" placeholder="Paste a dental benefit summary here"></textarea>
-
-  <label for="file">Or upload a .txt or .pdf file</label>
-  <input id="file" type="file" accept=".txt,.pdf,text/plain,application/pdf">
-  <p>If a file is selected, it is used instead of the paste box. Clear the file choice to use pasted text.</p>
-
-  <button id="run" type="button">Extract</button>
+  <label for="file">PDF file</label>
+  <input id="file" type="file" accept=".pdf,application/pdf">
+  <button id="render" type="button">Render pages</button>
   <button id="clear-file" type="button">Clear file</button>
-  <p id="status" class="status" role="status"></p>
+  <p id="status" class="status" role="status">Nothing is extracted in the browser.</p>
 
-  <h2>readable_summary</h2>
-  <pre id="summary-out"></pre>
-  <h2>JSON</h2>
-  <pre id="json-out"></pre>
   <h2>Page images</h2>
   <div id="pages" class="pages"></div>
-  <h2>Text passed to extract_text (paste and .txt only)</h2>
-  <pre id="text-out"></pre>
 
-  <script src="https://cdn.jsdelivr.net/pyodide/v314.0.7/full/pyodide.js"></script>
-  <script src="page.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.8.69/pdf.min.mjs" type="module"></script>
+  <script src="page.js" type="module"></script>
 </body>
 </html>

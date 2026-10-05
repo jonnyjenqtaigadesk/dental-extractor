@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for the dental benefit summary extractor. Fixtures are fake."""
+"""Coercer tests. These do not call Google."""
 
 from __future__ import annotations
 
@@ -9,42 +9,61 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from unittest import mock
+from io import StringIO
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
 import extract  # noqa: E402
 
-FIX1 = ROOT / "fixtures" / "fixture1_rich.txt"
-FIX2 = ROOT / "fixtures" / "fixture2_sparse.txt"
-TEXT1 = FIX1.read_text(encoding="utf-8")
-TEXT2 = FIX2.read_text(encoding="utf-8")
+
+def dig(fields, path):
+    current = fields
+    for part in path.split("."):
+        current = current[part]
+    return current
 
 
-def leaves(fields):
-    return list(extract.iter_leaves(fields))
+def assert_all_not_found(testcase, record):
+    for path, leaf in extract.iter_leaves(record["fields"]):
+        testcase.assertEqual(leaf["status"], "not_found", path)
+        testcase.assertIsNone(leaf["value"], path)
+        testcase.assertIsNone(leaf["page"], path)
+        testcase.assertIsNone(leaf["excerpt"], path)
 
 
-def assert_leaf_rules(testcase: unittest.TestCase, source: str, fields: dict) -> None:
-    for path, leaf in leaves(fields):
-        if leaf["status"] == "found":
-            testcase.assertIsInstance(leaf["evidence"], str, path)
-            testcase.assertIn(leaf["evidence"], source, path)
-            testcase.assertNotIn(leaf["value"], (None, False, True), path)
-            if isinstance(leaf["value"], str):
-                testcase.assertIn(leaf["value"], leaf["evidence"], path)
-            for tok in extract.number_tokens(leaf["value"]):
-                testcase.assertIn(tok, leaf["evidence"], path)
-        else:
-            testcase.assertEqual(leaf["status"], "not_found", path)
-            testcase.assertIsNone(leaf["value"], path)
-            testcase.assertIsNone(leaf["evidence"], path)
-            testcase.assertIsNot(leaf["value"], False, path)
+def assert_schema(testcase, record):
+    fields = record["fields"]
+    testcase.assertEqual(
+        set(fields),
+        set(extract.SINGLE_FIELDS) | set(extract.NETWORK_GROUPS) | {"waiting_period"},
+    )
+    for name in extract.NETWORK_GROUPS:
+        testcase.assertEqual(set(fields[name]), {"in_network", "out_of_network", "unlabeled"}, name)
+    testcase.assertEqual(set(fields["waiting_period"]), {"basic", "major", "ortho"})
+    testcase.assertNotIn("preventive", fields["waiting_period"])
+    testcase.assertIsInstance(record["usable"], bool)
+    testcase.assertTrue(record["failure_reason"] is None or isinstance(record["failure_reason"], str))
 
 
-def build_pdf(lines: list[str]) -> bytes:
+def plan_payload(excerpts, **header):
+    body = {
+        "carrier": header.get("carrier", {"page": 1, "excerpt": "Northwind Dental"}),
+        "plan_name": header.get("plan_name", {"page": 1, "excerpt": "Plan name: Example Dental PPO"}),
+        "plan_type": header.get("plan_type", {"page": 1, "excerpt": "Plan type: PPO"}),
+        "excerpts": [{"page": 1, "excerpt": line} if isinstance(line, str) else line for line in excerpts],
+    }
+    return {"plans": [body]}
+
+
+def one(payload, pages_read=None):
+    records = extract.coerce_model_json(payload, pages_read)
+    return records
+
+
+def build_pdf(lines):
     content = ["BT", "/F1 10 Tf", "50 750 Td"]
     for index, line in enumerate(lines):
         esc = line.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
@@ -78,371 +97,526 @@ def build_pdf(lines: list[str]) -> bytes:
     return bytes(out)
 
 
-class Fixture1Tests(unittest.TestCase):
-    def setUp(self):
-        self.data = extract.extract_text(TEXT1)
-        self.fields = self.data["fields"]
+class CoercerRulesTests(unittest.TestCase):
+    def test_silence_is_not_found(self):
+        for payload in ({}, {"plans": []}, {"plans": [{}]}, {"plans": [{"carrier": {"page": 1, "excerpt": "   "}}]}):
+            records = one(payload)
+            self.assertEqual(len(records), 1)
+            assert_schema(self, records[0])
+            assert_all_not_found(self, records[0])
+            self.assertFalse(records[0]["usable"])
+        missing_page = one({"plans": [{"carrier": {"excerpt": "Acme Dental"}}]})
+        self.assertEqual(dig(missing_page[0]["fields"], "carrier")["status"], "not_found")
+        self.assertIsNone(dig(missing_page[0]["fields"], "carrier")["excerpt"])
 
-    def test_found_slots_and_evidence(self):
-        classes = self.fields["plan_pay_percent_by_class"]
-        self.assertEqual(
-            set(classes),
-            {"Diagnostic and Preventive", "Basic", "Major Restorative"},
+    def test_in_network_is_not_copied_out(self):
+        records = one(
+            plan_payload(["In-network preventive 100% / basic 80% / major 50%", "Annual maximum $1,500"])
         )
-        expected = {
-            "Diagnostic and Preventive": ("100%", "80%"),
-            "Basic": ("80%", "60%"),
-            "Major Restorative": ("50%", "40%"),
-        }
-        for name, (inn, oon) in expected.items():
-            self.assertEqual(classes[name]["in_network"]["status"], "found")
-            self.assertEqual(classes[name]["out_of_network"]["status"], "found")
-            self.assertEqual(classes[name]["in_network"]["value"], inn)
-            self.assertEqual(classes[name]["out_of_network"]["value"], oon)
-            self.assertIn(classes[name]["in_network"]["evidence"], TEXT1)
-            self.assertIn(inn, classes[name]["in_network"]["evidence"])
-            self.assertIn(oon, classes[name]["out_of_network"]["evidence"])
+        fields = records[0]["fields"]
+        for name, expected in (("preventive", 100), ("basic", 80), ("major", 50)):
+            inn = fields[name]["in_network"]
+            self.assertEqual(inn["status"], "found", name)
+            self.assertEqual(inn["value"]["normalized"], expected, name)
+            self.assertEqual(fields[name]["out_of_network"]["status"], "not_found", name)
+            self.assertEqual(fields[name]["unlabeled"]["status"], "not_found", name)
+            self.assertNotEqual(fields[name]["out_of_network"].get("value"), inn["value"])
 
-        maximum = self.fields["annual_or_contract_maximum"]
-        self.assertEqual(maximum["amount_per_person"]["value"], "$1,500")
-        self.assertIn("annual", maximum["period"]["value"].lower())
-        self.assertNotIn("contract", maximum["period"]["value"].lower())
-        self.assertEqual(self.fields["deductible"]["per_person"]["value"], "$50")
-        self.assertEqual(self.fields["deductible"]["family_maximum"]["value"], "$150")
-        self.assertEqual(self.fields["deductible"]["waived_for_diagnostic_and_preventive"]["status"], "found")
-        self.assertIn("waived", self.fields["deductible"]["waived_for_diagnostic_and_preventive"]["value"].lower())
+    def test_unlabeled_triple_order_two_triples_and_fourth(self):
+        single = one(plan_payload(["100/80/50"]))[0]["fields"]
+        self.assertEqual(single["preventive"]["unlabeled"]["value"]["normalized"], 100)
+        self.assertEqual(single["basic"]["unlabeled"]["value"]["normalized"], 80)
+        self.assertEqual(single["major"]["unlabeled"]["value"]["normalized"], 50)
+        self.assertEqual(single["endodontics"]["unlabeled"]["status"], "not_found")
+        self.assertEqual(single["preventive"]["in_network"]["status"], "not_found")
 
-        ortho = self.fields["orthodontics"]
-        self.assertEqual(ortho["lifetime_maximum"]["value"], "$1,000")
-        self.assertEqual(ortho["child_eligibility"]["status"], "found")
-        self.assertIn("children only", ortho["child_eligibility"]["value"])
+        fourth = one(plan_payload(["100/80/50/40"]))[0]
+        fields = fourth["fields"]
+        self.assertEqual(fields["preventive"]["unlabeled"]["value"]["normalized"], 100)
+        self.assertEqual(fields["basic"]["unlabeled"]["value"]["normalized"], 80)
+        self.assertEqual(fields["major"]["unlabeled"]["value"]["normalized"], 50)
+        self.assertEqual(fields["endodontics"]["unlabeled"]["status"], "not_found")
+        blob = json.dumps(fourth)
+        self.assertNotIn('"normalized": 40', blob)
 
-        cleanings = self.fields["frequencies"]["cleanings"]["frequency"]
-        self.assertEqual(cleanings["status"], "found")
-        self.assertIn("2 per year", cleanings["evidence"])
-        self.assertIn("2 per year", cleanings["value"])
-
-        self.assertEqual(self.fields["plan_type"]["value"], "PPO")
-        self.assertIn("PPO", self.fields["plan_type"]["evidence"])
-        waiting = self.fields["waiting_periods"]
-        self.assertEqual(waiting["collection"]["status"], "found")
-        self.assertEqual(set(waiting["by_class"]), {"Major Restorative"})
-        self.assertEqual(waiting["by_class"]["Major Restorative"]["value"], "12-month")
-        self.assertIn("12-month", waiting["by_class"]["Major Restorative"]["evidence"])
-
-        self.assertEqual(self.fields["cost_share"]["in_network"]["status"], "found")
-        self.assertEqual(self.fields["cost_share"]["out_of_network"]["status"], "found")
-
-    def test_not_found_slots_and_crown_is_not_major(self):
-        fields = self.fields
-        for path in (
-            "annual_maximum_carryover",
-            "deductible.waived_for_orthodontics",
-            "orthodontics.adult_eligibility",
-            "implants",
-            "missing_tooth_clause",
-            "tmj",
-            "dependent_age",
-            "cost_share.second_network",
+        conflicted = one(plan_payload(["100/80/50", "90/70/40"]))[0]["fields"]
+        for name, expected in (
+            ("preventive", {100, 90}),
+            ("basic", {80, 70}),
+            ("major", {50, 40}),
         ):
-            leaf = fields
-            for part in path.split("."):
-                leaf = leaf[part]
-            self.assertEqual(leaf["status"], "not_found", path)
-            self.assertIsNone(leaf["value"], path)
-            self.assertIsNot(leaf["value"], False, path)
+            slot = conflicted[name]["unlabeled"]
+            self.assertEqual(slot["status"], "conflict", name)
+            self.assertGreaterEqual(len(slot["sides"]), 2, name)
+            norms = {side["value"]["normalized"] for side in slot["sides"]}
+            self.assertEqual(norms, expected, name)
+            for side in slot["sides"]:
+                self.assertIn("value", side)
+                self.assertIn("page", side)
+                self.assertIn("excerpt", side)
+                self.assertIsInstance(side["excerpt"], str)
+                self.assertTrue(side["excerpt"])
 
-        classes = fields["plan_pay_percent_by_class"]
-        for absent in (
-            "Endodontics",
-            "Periodontics",
-            "Oral Surgery",
-            "Prosthodontics",
-            "Major",
-            "Crowns",
-            "Class I",
-            "Class II",
-            "Class III",
-        ):
-            self.assertNotIn(absent, classes)
-        for name in classes:
-            self.assertNotEqual(name.strip().lower(), "major")
-            self.assertNotIn("class iii", name.lower())
-            self.assertNotIn("class i", name.lower())
+        labeled = one(plan_payload(["Major 100% / Basic 80% / Preventive 50%"]))[0]["fields"]
+        self.assertEqual(labeled["major"]["unlabeled"]["value"]["normalized"], 100)
+        self.assertEqual(labeled["basic"]["unlabeled"]["value"]["normalized"], 80)
+        self.assertEqual(labeled["preventive"]["unlabeled"]["value"]["normalized"], 50)
 
-        crown = fields["frequencies"]["crowns"]["frequency"]
-        self.assertEqual(crown["status"], "found")
-        self.assertNotIn("Major", crown["value"])
-        self.assertNotIn("Major", crown["evidence"])
-        self.assertEqual(fields["frequencies"]["crowns"]["replacement_period"]["status"], "not_found")
-        self.assertEqual(fields["frequencies"]["cleanings"]["age_limit"]["status"], "not_found")
-        # Waiting period exists only for the printed class, not a zero grid.
-        self.assertNotIn("Basic", fields["waiting_periods"]["by_class"])
-        self.assertNotIn("Diagnostic and Preventive", fields["waiting_periods"]["by_class"])
+    def test_member_pay_and_mismatch_conflict(self):
+        leaf = one(plan_payload(["Preventive: you pay 20%"]))[0]["fields"]["preventive"]["unlabeled"]
+        self.assertEqual(leaf["status"], "found")
+        self.assertEqual(leaf["value"]["normalized"], 80)
+        self.assertIn("you pay 20%", leaf["excerpt"])
+        self.assertIn("you pay 20%", leaf["value"]["printed"])
+        self.assertNotEqual(leaf["value"]["normalized"], 20)
 
-    def test_summary_mentions_only_found_values(self):
-        summary = self.data["readable_summary"]
-        found_part, missing_part = summary.split("Not found:", 1)
-        self.assertIn("$1,500", found_part)
-        self.assertIn("PPO", found_part)
-        self.assertIn("2 per year", found_part)
-        self.assertIn("12-month", found_part)
-        self.assertNotIn("$1,500", missing_part)
-        self.assertNotIn("%", missing_part)
-        self.assertIn("annual_maximum_carryover", missing_part)
-        self.assertIn("orthodontics.adult_eligibility", missing_part)
-        self.assertIn("cost_share.second_network", missing_part)
-        for _, leaf in leaves(self.fields):
-            if leaf["status"] == "found" and isinstance(leaf["value"], str):
-                shown = leaf["value"].replace("\n", " ")
-                self.assertIn(shown, summary)
+        both_ok = one(plan_payload(["Preventive plan pays 80%, you pay 20%"]))[0]["fields"]["preventive"]["unlabeled"]
+        self.assertEqual(both_ok["status"], "found")
+        self.assertEqual(both_ok["value"]["normalized"], 80)
+        self.assertIn("you pay 20%", both_ok["excerpt"])
 
+        bad = one(plan_payload(["Preventive plan pays 70%, you pay 20%"]))[0]["fields"]["preventive"]["unlabeled"]
+        self.assertEqual(bad["status"], "conflict")
+        norms = {side["value"]["normalized"] for side in bad["sides"]}
+        self.assertEqual(norms, {70, 20})
+        excerpts = " ".join(side["excerpt"] for side in bad["sides"])
+        self.assertIn("you pay 20%", excerpts)
+        self.assertIn("plan pays 70%", excerpts)
 
-class Fixture2Tests(unittest.TestCase):
-    def test_every_benefit_slot_not_found(self):
-        data = extract.extract_text(TEXT2)
-        found = [path for path, leaf in leaves(data["fields"]) if leaf["status"] == "found"]
-        self.assertEqual(found, [])
-        assert_leaf_rules(self, TEXT2, data["fields"])
-        blob = json.dumps(data["fields"])
-        summary = data["readable_summary"]
-        for banned in ("100%", "$", "PPO", "555", "80%"):
-            self.assertNotIn(banned, blob)
-            self.assertNotIn(banned, summary)
-        # Slot names such as waived_for_diagnostic_and_preventive may appear
-        # in the not-found list. They must not be stated as values.
-        self.assertNotIn(": waived", summary.lower())
-        self.assertNotIn(": 100", summary)
-        self.assertIn("Found:\n- (none)", summary)
-        self.assertEqual(data["notes"], [])
+        bare = one(plan_payload(["80%"]))[0]["fields"]
+        for name in ("preventive", "basic", "major", "endodontics"):
+            self.assertEqual(bare[name]["unlabeled"]["status"], "not_found", name)
 
+    def test_deductible_maximum_lifetime_and_copay(self):
+        fields = one(plan_payload(["Deductible: $50"]))[0]["fields"]
+        self.assertEqual(fields["deductible_unlabeled"]["unlabeled"]["status"], "found")
+        self.assertEqual(fields["deductible_unlabeled"]["unlabeled"]["value"]["normalized"], 50)
+        self.assertEqual(fields["deductible_individual"]["unlabeled"]["status"], "not_found")
+        self.assertEqual(fields["deductible_individual"]["in_network"]["status"], "not_found")
+        self.assertEqual(fields["deductible_family"]["unlabeled"]["status"], "not_found")
 
-class EvidenceTests(unittest.TestCase):
-    def test_every_found_evidence_is_a_source_substring(self):
-        for source in (TEXT1, TEXT2):
-            data = extract.extract_text(source)
-            assert_leaf_rules(self, source, data["fields"])
-            for note in data["notes"]:
-                self.assertIn(note, source)
-                self.assertIsInstance(note, str)
+        family_max = one(plan_payload(["Family annual maximum $3,000"]))[0]["fields"]
+        for slot in family_max["annual_maximum"].values():
+            self.assertEqual(slot["status"], "not_found")
+        self.assertEqual(family_max["ortho_lifetime_max"]["status"], "not_found")
 
-    def test_period_not_invented_when_unprinted(self):
-        data = extract.extract_text("Benefit maximum per person: $500\n")
-        maximum = data["fields"]["annual_or_contract_maximum"]
-        self.assertEqual(maximum["amount_per_person"]["status"], "found")
-        self.assertEqual(maximum["amount_per_person"]["value"], "$500")
-        self.assertEqual(maximum["period"]["status"], "not_found")
-        self.assertIsNone(maximum["period"]["value"])
+        lifetime = one(plan_payload(["Lifetime maximum $5,000"]))[0]["fields"]
+        for slot in lifetime["annual_maximum"].values():
+            self.assertEqual(slot["status"], "not_found")
+        self.assertEqual(lifetime["ortho_lifetime_max"]["status"], "not_found")
 
-    def test_preventive_waiver_does_not_set_ortho_false(self):
-        fields = extract.extract_text("Deductible waived for preventive services.\n")["fields"]
-        self.assertEqual(fields["deductible"]["waived_for_diagnostic_and_preventive"]["status"], "found")
-        ortho = fields["deductible"]["waived_for_orthodontics"]
-        self.assertEqual(ortho["status"], "not_found")
-        self.assertIsNone(ortho["value"])
+        neither = one(plan_payload(["Maximum $1,500"]))[0]["fields"]
+        for slot in neither["annual_maximum"].values():
+            self.assertEqual(slot["status"], "not_found")
 
-    def test_word_percents_are_not_rewritten_as_digits(self):
-        data = extract.extract_text("Plan pays eighty percent for Basic services in-network.\n")
-        blob = json.dumps(data["fields"])
-        self.assertNotIn("80", blob)
-        self.assertEqual(data["fields"]["plan_pay_percent_by_class"], {})
+        copay = one(plan_payload(["Basic $40"]))[0]["fields"]["basic"]["unlabeled"]
+        self.assertEqual(copay["status"], "found")
+        self.assertEqual(copay["value"]["normalized"], 40)
+        self.assertIn("$40", copay["value"]["printed"])
+        self.assertNotIn("%", copay["value"]["printed"])
 
-    def test_second_network_only_when_printed(self):
-        text = (
-            "In-Network    Premier Dental    Out-of-Network\n"
-            "Diagnostic and Preventive    100%    90%    80%\n"
+        mixed = one(plan_payload(["Basic 80% copay $25"]))[0]["fields"]["basic"]["unlabeled"]
+        self.assertEqual(mixed["status"], "conflict")
+        norms = {side["value"]["normalized"] for side in mixed["sides"]}
+        self.assertEqual(norms, {80, 25})
+
+    def test_endo_not_inferred_and_assignment_requires_percent(self):
+        major = one(plan_payload(["Major 50%"]))[0]["fields"]
+        self.assertEqual(major["major"]["unlabeled"]["value"]["normalized"], 50)
+        self.assertEqual(major["endodontics"]["unlabeled"]["status"], "not_found")
+        self.assertEqual(major["basic"]["unlabeled"]["status"], "not_found")
+
+        bare_assign = one(plan_payload(["Endodontics, periodontics, and oral surgery paid as basic"]))[0]["fields"]
+        for name in ("endodontics", "periodontics", "oral_surgery", "basic"):
+            self.assertEqual(bare_assign[name]["unlabeled"]["status"], "not_found", name)
+
+        assigned = one(plan_payload(["Endodontics paid as basic. Basic 80%."]))[0]["fields"]
+        self.assertEqual(assigned["basic"]["unlabeled"]["status"], "found")
+        self.assertEqual(assigned["basic"]["unlabeled"]["value"]["normalized"], 80)
+        endo = assigned["endodontics"]["unlabeled"]
+        self.assertEqual(endo["status"], "found")
+        self.assertEqual(endo["value"]["normalized"], 80)
+        self.assertIn("Endodontics", endo["excerpt"])
+        self.assertIn("80", endo["excerpt"])
+        self.assertIn("basic", endo["excerpt"].lower())
+
+    def test_waiting_waiver_age_and_basis(self):
+        fields = one(
+            plan_payload(
+                [
+                    "Basic waiting period: 6 months",
+                    "Major waiting period: 12 months",
+                    "Orthodontia waiting period: none",
+                    "Preventive waiting period: 0 months",
+                    "Preventive 100%",
+                    "Orthodontia for children",
+                    "Out-of-network basis: UCR",
+                ]
+            )
+        )[0]["fields"]
+        self.assertEqual(set(fields["waiting_period"]), {"basic", "major", "ortho"})
+        self.assertNotIn("preventive", fields["waiting_period"])
+        basic = fields["waiting_period"]["basic"]
+        self.assertEqual(basic["status"], "found")
+        self.assertEqual(basic["value"]["normalized"], 6)
+        self.assertEqual(fields["waiting_period"]["major"]["value"]["normalized"], 12)
+        ortho = fields["waiting_period"]["ortho"]
+        self.assertEqual(ortho["status"], "found")
+        self.assertEqual(ortho["value"]["printed"], "none")
+        self.assertIsNone(ortho["value"]["normalized"])
+        self.assertNotEqual(ortho["value"]["normalized"], 0)
+        self.assertNotEqual(ortho["value"]["printed"], 0)
+        self.assertEqual(fields["preventive_deductible_waived"]["status"], "not_found")
+        self.assertEqual(fields["ortho_age_limit"]["status"], "not_found")
+        basis = fields["out_of_network_basis"]
+        self.assertEqual(basis["status"], "found")
+        self.assertEqual(basis["value"]["printed"], "Out-of-network basis: UCR")
+        self.assertIsNone(basis["value"]["normalized"])
+        self.assertNotIn("90", json.dumps(basis))
+
+        waived = one(plan_payload(["Preventive deductible waived"]))[0]["fields"]["preventive_deductible_waived"]
+        self.assertEqual(waived["status"], "found")
+        self.assertEqual(waived["value"]["printed"], "waived")
+        self.assertIsNone(waived["value"]["normalized"])
+
+        applies = one(plan_payload(["Deductible applies to preventive"]))[0]["fields"]["preventive_deductible_waived"]
+        self.assertEqual(applies["value"]["printed"], "applies")
+
+        no_limit = one(plan_payload(["Orthodontia: No age limit"]))[0]["fields"]["ortho_age_limit"]
+        self.assertEqual(no_limit["status"], "found")
+        self.assertIsNone(no_limit["value"]["normalized"])
+        self.assertIn("no age limit", no_limit["value"]["printed"].lower())
+        self.assertNotIsInstance(no_limit["value"]["normalized"], (int, float))
+        self.assertNotEqual(no_limit["value"]["printed"], "19")
+
+        age = one(plan_payload(["Orthodontia to age 19"]))[0]["fields"]["ortho_age_limit"]
+        self.assertEqual(age["status"], "found")
+        self.assertEqual(age["value"]["normalized"], 19)
+
+    def test_usable_flag(self):
+        good = one(
+            plan_payload(
+                [
+                    "Annual maximum: $1,500 per person",
+                    "Preventive 100% / Basic 80% / Major 50%",
+                ]
+            )
+        )[0]
+        self.assertTrue(good["usable"])
+        self.assertIsNone(good["failure_reason"])
+        annual = good["fields"]["annual_maximum"]["unlabeled"]
+        self.assertEqual(annual["status"], "found")
+        self.assertEqual(annual["value"]["normalized"], 1500)
+        self.assertEqual(annual["page"], 1)
+        self.assertIn("$1,500", annual["excerpt"])
+
+        missing_carrier = plan_payload(["Annual maximum $1,500", "Preventive 100% / Basic 80% / Major 50%"])
+        missing_carrier["plans"][0]["carrier"] = {"page": 1, "excerpt": ""}
+        self.assertFalse(one(missing_carrier)[0]["usable"])
+
+        carrier_conflict = plan_payload(["Annual maximum $1,500", "Preventive 100% / Basic 80% / Major 50%"])
+        carrier_conflict["plans"][0]["carrier"] = [
+            {"page": 1, "excerpt": "Northwind Dental"},
+            {"page": 1, "excerpt": "Southwind Dental"},
+        ]
+        conflicted = one(carrier_conflict)[0]
+        self.assertEqual(conflicted["fields"]["carrier"]["status"], "conflict")
+        self.assertFalse(conflicted["usable"])
+
+        missing_annual = one(plan_payload(["Preventive 100% / Basic 80% / Major 50%"]))[0]
+        self.assertFalse(missing_annual["usable"])
+
+        annual_conflict = one(
+            plan_payload(
+                [
+                    "Annual maximum $1,500",
+                    "Annual maximum $2,000",
+                    "Preventive 100% / Basic 80% / Major 50%",
+                ]
+            )
+        )[0]
+        self.assertEqual(annual_conflict["fields"]["annual_maximum"]["unlabeled"]["status"], "conflict")
+        self.assertFalse(annual_conflict["usable"])
+
+        missing_preventive = one(plan_payload(["Annual maximum $1,500", "Basic 80% / Major 50%"]))[0]
+        self.assertEqual(missing_preventive["fields"]["preventive"]["unlabeled"]["status"], "not_found")
+        self.assertFalse(missing_preventive["usable"])
+
+        class_conflict = one(
+            plan_payload(
+                [
+                    "Annual maximum $1,500",
+                    "Preventive 100%",
+                    "Preventive 90%",
+                    "Basic 80%",
+                    "Major 50%",
+                ]
+            )
+        )[0]
+        self.assertEqual(class_conflict["fields"]["preventive"]["unlabeled"]["status"], "conflict")
+        self.assertFalse(class_conflict["usable"])
+
+    def test_failure_record_and_unread_page_dropped(self):
+        record = extract.blank_record("gemini http 500: boom")
+        assert_schema(self, record)
+        assert_all_not_found(self, record)
+        self.assertFalse(record["usable"])
+        self.assertIn("gemini http 500", record["failure_reason"])
+
+        payload = plan_payload(
+            [
+                {"page": 2, "excerpt": "Annual maximum $1,500"},
+                {"page": 1, "excerpt": "Preventive 100% / Basic 80% / Major 50%"},
+            ],
+            carrier={"page": 2, "excerpt": "Northwind Dental"},
         )
-        fields = extract.extract_text(text)["fields"]
-        self.assertEqual(fields["cost_share"]["second_network"]["value"], "Premier Dental")
-        self.assertIn("Premier Dental", text)
-        row = fields["plan_pay_percent_by_class"]["Diagnostic and Preventive"]
-        self.assertEqual(row["second_network"]["value"], "90%")
-        self.assertEqual(row["in_network"]["value"], "100%")
-        self.assertEqual(row["out_of_network"]["value"], "80%")
+        record = one(payload, pages_read={1})[0]
+        self.assertEqual(record["fields"]["carrier"]["status"], "not_found")
+        self.assertIsNone(record["fields"]["carrier"]["excerpt"])
+        for slot in record["fields"]["annual_maximum"].values():
+            self.assertEqual(slot["status"], "not_found")
+        self.assertEqual(record["fields"]["preventive"]["unlabeled"]["status"], "found")
+        self.assertEqual(record["fields"]["preventive"]["unlabeled"]["page"], 1)
+        self.assertFalse(record["usable"])
 
-    def test_no_network_imports(self):
+    def test_contract_lines_if_quoted_verbatim(self):
+        lines = [
+            "Annual maximum: $1,500 per person",
+            "In-network individual deductible: $50",
+            "Out-of-network individual deductible: $75",
+            "Preventive 100% / Basic 80% / Major 50% in-network",
+            "Out-of-network preventive 80% / basic 60% / major 40%",
+            "Endodontics, periodontics, and oral surgery paid as basic",
+            "Preventive deductible waived",
+            "Orthodontia lifetime maximum $1,500",
+            "Orthodontia copay $0",
+            "Orthodontia to age 19",
+            "Basic waiting period: 6 months",
+            "Major waiting period: 12 months",
+            "Orthodontia waiting period: none",
+            "Out-of-network basis: 90th percentile of UCR",
+        ]
+        record = one(plan_payload(lines), pages_read={1})[0]
+        assert_schema(self, record)
+        self.assertTrue(record["usable"])
+        fields = record["fields"]
+        self.assertEqual(fields["carrier"]["value"]["printed"], "Northwind Dental")
+        self.assertEqual(fields["plan_name"]["value"]["printed"], "Example Dental PPO")
+        self.assertEqual(fields["plan_type"]["value"]["printed"], "PPO")
+        self.assertEqual(fields["annual_maximum"]["unlabeled"]["value"]["normalized"], 1500)
+        self.assertEqual(fields["annual_maximum"]["in_network"]["status"], "not_found")
+        self.assertEqual(fields["deductible_individual"]["in_network"]["value"]["normalized"], 50)
+        self.assertEqual(fields["deductible_individual"]["out_of_network"]["value"]["normalized"], 75)
+        self.assertEqual(fields["deductible_unlabeled"]["unlabeled"]["status"], "not_found")
+        self.assertEqual(fields["preventive"]["in_network"]["value"]["normalized"], 100)
+        self.assertEqual(fields["basic"]["in_network"]["value"]["normalized"], 80)
+        self.assertEqual(fields["major"]["in_network"]["value"]["normalized"], 50)
+        self.assertEqual(fields["preventive"]["out_of_network"]["value"]["normalized"], 80)
+        self.assertEqual(fields["basic"]["out_of_network"]["value"]["normalized"], 60)
+        self.assertEqual(fields["major"]["out_of_network"]["value"]["normalized"], 40)
+        for name in ("endodontics", "periodontics", "oral_surgery"):
+            self.assertEqual(fields[name]["in_network"]["status"], "not_found", name)
+            self.assertEqual(fields[name]["unlabeled"]["status"], "not_found", name)
+        self.assertEqual(fields["preventive_deductible_waived"]["value"]["printed"], "waived")
+        self.assertEqual(fields["ortho_lifetime_max"]["value"]["normalized"], 1500)
+        self.assertEqual(fields["ortho_coinsurance_or_copay"]["value"]["normalized"], 0)
+        self.assertEqual(fields["ortho_coinsurance_or_copay"]["status"], "found")
+        self.assertNotEqual(fields["ortho_lifetime_max"]["value"]["normalized"], 0)
+        self.assertEqual(fields["ortho_age_limit"]["value"]["normalized"], 19)
+        self.assertEqual(fields["waiting_period"]["basic"]["value"]["normalized"], 6)
+        self.assertEqual(fields["waiting_period"]["major"]["value"]["normalized"], 12)
+        self.assertEqual(fields["waiting_period"]["ortho"]["value"]["printed"], "none")
+        self.assertIsNone(fields["out_of_network_basis"]["value"]["normalized"])
+        self.assertIn("90th percentile of UCR", fields["out_of_network_basis"]["value"]["printed"])
+        for path, leaf in extract.iter_leaves(fields):
+            if leaf["status"] == "conflict":
+                self.fail(path)
+
+    def test_one_record_per_plan_and_procedure_list_omitted(self):
+        records = one(
+            {
+                "plans": [
+                    {"carrier": {"page": 1, "excerpt": "Alpha Dental"}},
+                    {"carrier": {"page": 1, "excerpt": "Beta Dental"}},
+                ]
+            }
+        )
+        self.assertEqual(len(records), 2)
+        self.assertEqual(records[0]["fields"]["carrier"]["value"]["printed"], "Alpha Dental")
+        self.assertEqual(records[1]["fields"]["carrier"]["value"]["printed"], "Beta Dental")
+
+        record = one(
+            plan_payload(
+                [
+                    "D0120 $20 D1110 $30 D2140 $40",
+                    "Annual maximum $1,000",
+                    "Preventive 100% / Basic 80% / Major 50%",
+                ]
+            )
+        )[0]
+        assert_schema(self, record)
+        self.assertNotIn("implants", record["fields"])
+        self.assertNotIn("frequencies", json.dumps(record))
+        self.assertTrue(record["usable"])
+
+    def test_model_failure_payload_shape(self):
+        payload = extract.failure_payload("gemini http 400: bad", {"kind": "pdf-images", "name": "x.pdf"})
+        self.assertFalse(payload["ok"])
+        self.assertEqual(len(payload["records"]), 1)
+        assert_all_not_found(self, payload["records"][0])
+        self.assertFalse(payload["records"][0]["usable"])
+        self.assertIn("gemini http 400", payload["records"][0]["failure_reason"])
+
+
+class SourceAndCliTests(unittest.TestCase):
+    def assert_no_secret(self, text):
+        secret = os.environ.get("GEMINI_API_KEY")
+        if secret and secret in text:
+            self.fail("secret appeared in output")
+
+    def test_source_bans_and_key_name_only(self):
         source = (ROOT / "extract.py").read_text(encoding="utf-8")
-        for banned in ("requests", "http.client", "socket", "pip ", "tesseract", "pdftotext"):
+        for banned in ("tesseract", "pdftotext", "getTextContent"):
             self.assertNotIn(banned, source)
-        self.assertIn("urllib.request", source)
-        self.assertIn("pdftoppm", source)
-        self.assertIn("GEMINI_MODEL", source)
+        self.assertIn("gemini-3.8-flash", source)
         self.assertIn("CALLS_ENABLED = True", source)
-        self.assertIn("subprocess", source)
-        self.assertIn(
-            "quote the page verbatim in evidence, and if it is not printed, status not_found",
-            source,
-        )
+        self.assertIn("pdftoppm", source)
+        self.assertIn('"-r"', source)
+        self.assertIn('"200"', source)
+        self.assertIn("os.environ[\"GEMINI_API_KEY\"]", source)
+        self.assertIsNone(__import__("re").search(r"GEMINI_API_KEY\s*=\s*['\"]", source))
+        self.assertNotIn("AIza", source)
+        for banned in (
+            "plan_pay_percent_by_class",
+            "annual_maximum_carryover",
+            "missing_tooth",
+            "frequencies",
+        ):
+            self.assertNotIn(banned, source)
+        page = (ROOT / "page.js").read_text(encoding="utf-8")
+        html = (ROOT / "index.html").read_text(encoding="utf-8")
+        public = page + html
+        self.assertNotIn("generativelanguage", public)
+        self.assertNotIn("GEMINI_API_KEY", public)
+        self.assertNotIn("tesseract", public.lower())
+        self.assertNotIn("getTextContent", public)
+        self.assertNotIn("AIza", public)
+        self.assertIn("page.render", page)
+        self.assertIn("Nothing is extracted in the browser", public)
 
+    def test_text_and_stdin_do_not_call_or_find(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "note.txt"
+            path.write_text("Annual maximum $1,500\nPreventive 100%\n", encoding="utf-8")
+            with mock.patch.object(extract.urllib.request, "urlopen", side_effect=AssertionError("network")):
+                buf = StringIO()
+                with mock.patch.object(sys, "stdout", buf):
+                    code = extract.run(["--text", str(path)])
+            self.assertEqual(code, 0)
+            payload = json.loads(buf.getvalue())
+            self.assertTrue(payload["ok"])
+            self.assertEqual(len(payload["records"]), 1)
+            self.assertFalse(payload["records"][0]["usable"])
+            self.assertEqual(payload["records"][0]["failure_reason"], extract.TEXT_ONLY_REASON)
+            assert_all_not_found(self, payload["records"][0])
+            self.assert_no_secret(buf.getvalue())
 
-class CliTests(unittest.TestCase):
-    def test_cli_text_fixtures(self):
-        for path, raw in ((FIX1, TEXT1), (FIX2, TEXT2)):
+            buf = StringIO()
+            with mock.patch.object(sys, "stdin", StringIO("PPO annual maximum $1,500")):
+                with mock.patch.object(extract.urllib.request, "urlopen", side_effect=AssertionError("network")):
+                    with mock.patch.object(sys, "stdout", buf):
+                        code = extract.run(["-"])
+            self.assertEqual(code, 0)
+            payload = json.loads(buf.getvalue())
+            self.assertEqual(payload["source"]["kind"], "stdin")
+            assert_all_not_found(self, payload["records"][0])
+            self.assertIn("only a PDF page-image read can fill fields", payload["records"][0]["failure_reason"])
+
+    def test_cli_subprocess_text_exits_zero(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "note.txt"
+            path.write_text("not a pdf\n", encoding="utf-8")
             proc = subprocess.run(
                 [sys.executable, str(ROOT / "extract.py"), "--text", str(path)],
                 capture_output=True,
                 text=True,
                 check=False,
             )
-            self.assertEqual(proc.returncode, 0, proc.stderr)
-            payload = json.loads(proc.stdout)
-            self.assertTrue(payload["ok"])
-            self.assertEqual(payload["fields"], extract.extract_text(raw)["fields"])
-            direct = subprocess.run(
-                [sys.executable, str(ROOT / "extract.py"), str(path)],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            self.assertEqual(direct.returncode, 0, direct.stderr)
-            self.assertEqual(json.loads(direct.stdout)["fields"], payload["fields"])
-
-    def test_cli_stdin(self):
-        proc = subprocess.run(
-            [sys.executable, str(ROOT / "extract.py")],
-            input=TEXT2,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
         self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assert_no_secret(proc.stdout)
+        self.assert_no_secret(proc.stderr)
         payload = json.loads(proc.stdout)
-        self.assertEqual(payload["source"]["kind"], "stdin")
-        self.assertEqual(
-            [path for path, leaf in leaves(payload["fields"]) if leaf["status"] == "found"],
-            [],
-        )
+        self.assertTrue(payload["ok"])
+        assert_all_not_found(self, payload["records"][0])
 
-    def test_pdf_renders_images_and_does_not_call_ocr_or_network(self):
-        lines = [
-            "This is a PPO plan.",
-            "Per person annual maximum: $1,500",
-            "In-Network    Out-of-Network",
-            "Diagnostic and Preventive    100%    80%",
-        ]
-        with tempfile.TemporaryDirectory() as tmp:
-            tmp_path = Path(tmp)
-            pdf_path = tmp_path / "sample.pdf"
-            pdf_path.write_bytes(build_pdf(lines))
-            bin_dir = tmp_path / "bin"
-            bin_dir.mkdir()
-            marker = tmp_path / "banned-calls"
-            script = "#!/bin/sh\nprintf '%s\\n' \"$0\" >> " + str(marker) + "\nexit 99\n"
-            for name in ("tesseract", "pdftotext", "curl", "wget"):
-                fake = bin_dir / name
-                fake.write_text(script, encoding="utf-8")
-                fake.chmod(0o755)
-            env = os.environ.copy()
-            env.pop("GEMINI_API_KEY", None)
-            env["PATH"] = str(bin_dir) + os.pathsep + env.get("PATH", "")
-            before = set(Path(tempfile.gettempdir()).glob("dental-pdf-*"))
-            proc = subprocess.run(
-                [sys.executable, str(ROOT / "extract.py"), str(pdf_path)],
-                capture_output=True,
-                text=True,
-                check=False,
-                env=env,
-            )
-            after = set(Path(tempfile.gettempdir()).glob("dental-pdf-*"))
-            self.assertEqual(proc.returncode, 1, proc.stderr + proc.stdout)
-            self.assertFalse(marker.exists(), marker.read_text() if marker.exists() else "")
-            self.assertEqual(after, before)
-            payload = json.loads(proc.stdout)
-            self.assertEqual(payload, {"ok": False, "error": "GEMINI_API_KEY is not set"})
-            self.assertNotIn("fields", payload)
+    def test_missing_file_and_bad_pdf_and_missing_key(self):
+        buf = StringIO()
+        with mock.patch.object(sys, "stdout", buf):
+            code = extract.run(["/workspace/dental-extractor/fixtures/missing.pdf"])
+        self.assertNotEqual(code, 0)
+        payload = json.loads(buf.getvalue())
+        self.assertFalse(payload["ok"])
+        self.assertIn("not found", payload["error"].lower())
+        assert_all_not_found(self, payload["records"][0])
 
-    def test_bad_pdf_is_json_error(self):
         with tempfile.TemporaryDirectory() as tmp:
             pdf_path = Path(tmp) / "broken.pdf"
             pdf_path.write_bytes(b"this is not a pdf")
-            proc = subprocess.run(
-                [sys.executable, str(ROOT / "extract.py"), str(pdf_path)],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            self.assertNotEqual(proc.returncode, 0)
-            payload = json.loads(proc.stdout)
+            with mock.patch.object(extract.urllib.request, "urlopen", side_effect=AssertionError("network")):
+                buf = StringIO()
+                with mock.patch.object(sys, "stdout", buf):
+                    code = extract.run([str(pdf_path)])
+            self.assertNotEqual(code, 0)
+            payload = json.loads(buf.getvalue())
             self.assertFalse(payload["ok"])
             self.assertIn("pdftoppm", payload["error"])
             self.assertNotIn("pdftotext", payload["error"])
+            assert_all_not_found(self, payload["records"][0])
 
-    def test_missing_file_is_json_error(self):
-        proc = subprocess.run(
-            [sys.executable, str(ROOT / "extract.py"), "/workspace/dental-extractor/fixtures/missing.txt"],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        self.assertNotEqual(proc.returncode, 0)
-        payload = json.loads(proc.stdout)
-        self.assertFalse(payload["ok"])
-        self.assertIn("not found", payload["error"].lower())
+            good = Path(tmp) / "one.pdf"
+            good.write_bytes(build_pdf(["Annual maximum $1,500"]))
+            previous = os.environ.pop("GEMINI_API_KEY", None)
+            try:
+                with mock.patch.object(extract.urllib.request, "urlopen", side_effect=AssertionError("network")):
+                    buf = StringIO()
+                    with mock.patch.object(sys, "stdout", buf):
+                        code = extract.run([str(good)])
+            finally:
+                if previous is not None:
+                    os.environ["GEMINI_API_KEY"] = previous
+            self.assertEqual(code, 1)
+            payload = json.loads(buf.getvalue())
+            self.assertEqual(payload["error"], "GEMINI_API_KEY is not set")
+            assert_all_not_found(self, payload["records"][0])
+            self.assertFalse(payload["records"][0]["usable"])
+            self.assertEqual(payload["source"]["page_count"], 1)
 
+    def test_redact_and_unsent_request_shape(self):
+        previous = os.environ.get("GEMINI_API_KEY")
+        os.environ["GEMINI_API_KEY"] = "unit-test-not-a-real-key"
+        try:
+            hidden = extract.redact_secret("failure unit-test-not-a-real-key tail")
+            self.assertNotIn("unit-test-not-a-real-key", hidden)
+            self.assertIn("[redacted]", hidden)
+            request = extract.build_gemini_request([b"png-bytes"])
+            self.assertIn("/models/gemini-3.8-flash:generateContent", request["url"])
+            self.assertEqual(request["headers"]["x-goog-api-key"], "unit-test-not-a-real-key")
+            parts = request["body"]["contents"][0]["parts"]
+            self.assertEqual(parts[1]["text"], "Page 1 image follows.")
+            self.assertEqual(parts[2]["inline_data"]["mime_type"], "image/png")
+            self.assertNotIn("tesseract", json.dumps(request["body"]))
+        finally:
+            if previous is None:
+                os.environ.pop("GEMINI_API_KEY", None)
+            else:
+                os.environ["GEMINI_API_KEY"] = previous
 
-class GeminiPrepTests(unittest.TestCase):
-    def test_quote_filter_blank_evidence_is_not_found(self):
-        for raw in (
-            {"status": "found", "value": "100%", "evidence": ""},
-            {"status": "found", "value": "100%", "evidence": "   "},
-            {"status": "found", "value": "100%"},
-            {"status": "found", "value": "PPO", "evidence": None},
-        ):
-            leaf = extract.coerce_model_leaf(raw)
-            self.assertEqual(leaf["status"], "not_found")
-            self.assertIsNone(leaf["value"])
-            self.assertIsNone(leaf["evidence"])
-        fields = extract.fields_from_gemini(
-            {
-                "fields": {
-                    "plan_type": {"status": "found", "value": "PPO", "evidence": ""},
-                    "implants": {"status": "found", "value": "covered"},
-                    "plan_pay_percent_by_class": {
-                        "Major Restorative": {
-                            "in_network": {
-                                "status": "found",
-                                "value": "50%",
-                                "evidence": "Major Restorative 50%",
-                            },
-                            "out_of_network": {
-                                "status": "found",
-                                "value": "40%",
-                                "evidence": "",
-                            },
-                        }
-                    },
-                }
-            }
-        )
-        self.assertEqual(fields["plan_type"]["status"], "not_found")
-        self.assertIsNone(fields["plan_type"]["value"])
-        self.assertEqual(fields["implants"]["status"], "not_found")
-        row = fields["plan_pay_percent_by_class"]["Major Restorative"]
-        self.assertEqual(row["in_network"]["status"], "found")
-        self.assertEqual(row["in_network"]["evidence"], "Major Restorative 50%")
-        self.assertEqual(row["out_of_network"]["status"], "not_found")
-        self.assertIsNone(row["out_of_network"]["value"])
-        self.assertNotIn("Class III", fields["plan_pay_percent_by_class"])
-        self.assertNotIn("Major", fields["plan_pay_percent_by_class"])
+    def test_fake_response_is_coerced_without_google(self):
+        import urllib.request
 
-    def test_model_prose_is_not_regex_parsed(self):
-        payload = {
-            "candidates": [
-                {
-                    "content": {
-                        "parts": [
-                            {
-                                "text": "This is a PPO plan.\nPer person annual maximum: $1,500\n",
-                            }
-                        ]
-                    }
-                }
-            ]
-        }
-        fields = extract.parse_gemini_response(payload)
-        found = [path for path, leaf in leaves(fields) if leaf["status"] == "found"]
-        self.assertEqual(found, [])
-        quoted = extract.parse_gemini_response(
+        previous = os.environ.get("GEMINI_API_KEY")
+        os.environ["GEMINI_API_KEY"] = "unit-test-not-a-real-key"
+        body = json.dumps(
             {
                 "candidates": [
                     {
@@ -450,15 +624,12 @@ class GeminiPrepTests(unittest.TestCase):
                             "parts": [
                                 {
                                     "text": json.dumps(
-                                        {
-                                            "fields": {
-                                                "plan_type": {
-                                                    "status": "found",
-                                                    "value": "PPO",
-                                                    "evidence": "This is a PPO plan.",
-                                                }
-                                            }
-                                        }
+                                        plan_payload(
+                                            [
+                                                "Annual maximum: $1,500 per person",
+                                                "Preventive 100% / Basic 80% / Major 50%",
+                                            ]
+                                        )
                                     )
                                 }
                             ]
@@ -466,176 +637,43 @@ class GeminiPrepTests(unittest.TestCase):
                     }
                 ]
             }
-        )
-        self.assertEqual(quoted["plan_type"]["status"], "found")
-        self.assertEqual(quoted["plan_type"]["value"], "PPO")
-        self.assertEqual(quoted["plan_type"]["evidence"], "This is a PPO plan.")
-        self.assertEqual(quoted["annual_or_contract_maximum"]["amount_per_person"]["status"], "not_found")
+        ).encode("utf-8")
 
-    def test_missing_key_builds_no_request_and_does_not_use_network(self):
-        import socket
+        class FakeResponse:
+            def __enter__(self):
+                return self
 
-        previous = os.environ.pop("GEMINI_API_KEY", None)
+            def __exit__(self, *args):
+                return False
+
+            def read(self):
+                return body
+
         try:
-            blocked = extract.prepare_gemini_request([b"png"])
-            self.assertEqual(blocked, {"ok": False, "error": "GEMINI_API_KEY is not set"})
-            lines = ["This is a PPO plan."]
             with tempfile.TemporaryDirectory() as tmp:
                 pdf_path = Path(tmp) / "sample.pdf"
-                pdf_path.write_bytes(build_pdf(lines))
-                commands = []
-                real_run = extract.subprocess.run
-
-                def wrapped(cmd, *args, **kwargs):
-                    commands.append(list(cmd))
-                    if cmd[0] != "pdftoppm":
-                        raise AssertionError("unexpected command " + str(cmd[0]))
-                    return real_run(cmd, *args, **kwargs)
-
-                def no_network(*args, **kwargs):
-                    raise AssertionError("network")
-
-                with mock.patch.object(extract.subprocess, "run", wrapped):
-                    with mock.patch.object(extract, "extract_text", side_effect=AssertionError("extract_text")):
-                        with mock.patch.object(socket, "socket", no_network):
-                            with mock.patch.object(extract, "CALLS_ENABLED", True):
-                                from io import StringIO
-
-                                buf = StringIO()
-                                with mock.patch.object(sys, "stdout", buf):
-                                    code = extract.run([str(pdf_path)])
-                self.assertEqual(code, 1, buf.getvalue())
-                self.assertEqual(commands[0][0], "pdftoppm")
-                self.assertIn("200", commands[0])
-                self.assertEqual(json.loads(buf.getvalue())["error"], "GEMINI_API_KEY is not set")
-                self.assertNotIn("fields", json.loads(buf.getvalue()))
-        finally:
-            if previous is not None:
-                os.environ["GEMINI_API_KEY"] = previous
-
-    def test_request_shape_is_unsent(self):
-        import socket
-
-        previous = os.environ.pop("GEMINI_API_KEY", None)
-        os.environ["GEMINI_API_KEY"] = "x"
-        try:
-            def no_network(*args, **kwargs):
-                raise AssertionError("network")
-
-            with mock.patch.object(socket, "socket", no_network):
-                request = extract.build_gemini_request([b"png-bytes"])
-            self.assertEqual(extract.GEMINI_MODEL, "gemini-3.8-flash")
-            self.assertTrue(extract.CALLS_ENABLED)
-            self.assertIn("/models/gemini-3.8-flash:generateContent", request["url"])
-            self.assertEqual(request["headers"]["x-goog-api-key"], "x")
-            self.assertEqual(request["headers"]["Content-Type"], "application/json")
-            parts = request["body"]["contents"][0]["parts"]
-            self.assertEqual(parts[0]["text"][:1], "Y")
-            image = parts[1]["inline_data"]
-            self.assertEqual(image["mime_type"], "image/png")
-            self.assertEqual(image["data"], "cG5nLWJ5dGVz")
-            self.assertNotIn("fields", request)
-        finally:
-            os.environ.pop("GEMINI_API_KEY", None)
-            if previous is not None:
-                os.environ["GEMINI_API_KEY"] = previous
-
-
-
-    def test_pdf_uses_fake_gemini_response_not_extract_text(self):
-        import io
-        import urllib.request
-
-        previous = os.environ.pop("GEMINI_API_KEY", None)
-        os.environ["GEMINI_API_KEY"] = "x"
-        try:
-            body = json.dumps(
-                {
-                    "candidates": [
-                        {
-                            "content": {
-                                "parts": [
-                                    {
-                                        "text": json.dumps(
-                                            {
-                                                "fields": {
-                                                    "annual_or_contract_maximum": {
-                                                        "amount_per_person": {
-                                                            "status": "found",
-                                                            "value": "$1,500",
-                                                            "evidence": "Annual maximum $1,500 per person",
-                                                        },
-                                                        "period": {
-                                                            "status": "found",
-                                                            "value": "annual",
-                                                            "evidence": "",
-                                                        },
-                                                    },
-                                                    "plan_type": {
-                                                        "status": "found",
-                                                        "value": "PPO",
-                                                    },
-                                                }
-                                            }
-                                        )
-                                    }
-                                ]
-                            }
-                        }
-                    ]
-                }
-            ).encode("utf-8")
-
-            class FakeResponse:
-                def __enter__(self):
-                    return self
-
-                def __exit__(self, *args):
-                    return False
-
-                def read(self):
-                    return body
-
-            seen = {}
-
-            def fake_urlopen(req, timeout=0):
-                seen["url"] = req.full_url
-                seen["timeout"] = timeout
-                header = req.get_header("X-goog-api-key")
-                seen["header_is_placeholder"] = header == "x"
-                return FakeResponse()
-
-            lines = ["Annual maximum $1,500 per person"]
-            with tempfile.TemporaryDirectory() as tmp:
-                pdf_path = Path(tmp) / "sample.pdf"
-                pdf_path.write_bytes(build_pdf(lines))
-                with mock.patch.object(urllib.request, "urlopen", fake_urlopen):
-                    with mock.patch.object(extract, "extract_text", side_effect=AssertionError("extract_text")):
-                        buf = io.StringIO()
-                        with mock.patch.object(sys, "stdout", buf):
-                            code = extract.run([str(pdf_path)])
+                pdf_path.write_bytes(build_pdf(["Annual maximum: $1,500 per person"]))
+                with mock.patch.object(urllib.request, "urlopen", return_value=FakeResponse()):
+                    buf = StringIO()
+                    with mock.patch.object(sys, "stdout", buf):
+                        code = extract.run([str(pdf_path)])
             self.assertEqual(code, 0, buf.getvalue())
+            self.assert_no_secret(buf.getvalue())
+            self.assertNotIn("unit-test-not-a-real-key", buf.getvalue())
             payload = json.loads(buf.getvalue())
             self.assertTrue(payload["ok"])
-            self.assertNotIn("x-goog-api-key", buf.getvalue())
-            self.assertEqual(payload["source"]["kind"], "pdf-images")
+            self.assertTrue(payload["records"][0]["usable"])
             self.assertEqual(payload["source"]["provider"], "gemini")
-            self.assertEqual(payload["source"]["page_count"], 1)
-            amount = payload["fields"]["annual_or_contract_maximum"]["amount_per_person"]
-            self.assertEqual(amount["status"], "found")
-            self.assertEqual(amount["value"], "$1,500")
-            self.assertEqual(amount["evidence"], "Annual maximum $1,500 per person")
-            period = payload["fields"]["annual_or_contract_maximum"]["period"]
-            self.assertEqual(period["status"], "not_found")
-            self.assertIsNone(period["value"])
-            self.assertEqual(payload["fields"]["plan_type"]["status"], "not_found")
-            self.assertIn("gemini-3.8-flash:generateContent", seen["url"])
-            self.assertTrue(seen["header_is_placeholder"])
+            self.assertEqual(payload["source"]["pages_read"], [1])
+            annual = payload["records"][0]["fields"]["annual_maximum"]["unlabeled"]
+            self.assertEqual(annual["status"], "found")
+            self.assertEqual(annual["page"], 1)
+            self.assertIn("Annual maximum", annual["excerpt"])
         finally:
-            os.environ.pop("GEMINI_API_KEY", None)
-            if previous is not None:
+            if previous is None:
+                os.environ.pop("GEMINI_API_KEY", None)
+            else:
                 os.environ["GEMINI_API_KEY"] = previous
-
 
 
 if __name__ == "__main__":

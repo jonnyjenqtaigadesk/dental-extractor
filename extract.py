@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
-"""Extract dental plan-design fields from a summary.
+"""Extract dental plan-design fields from a benefit summary PDF.
 
-Pure Python 3. Pasted text, stdin, and --text go through extract_text.
-A PDF is rendered to PNG page images with pdftoppm. Those images are
-prepared for Google Gemini and are not read by extract_text. When
-GEMINI_API_KEY is set, those images are sent to Gemini. Nothing is filled from general
-dental knowledge.
+Results are CLI only. A PDF is rendered to PNG page images with
+pdftoppm. Those images are sent to Gemini. The coercer below applies
+the benefit rules to the model JSON. It does not read pixels, and it
+does not invent excerpts.
 
-NADP class names (Class I / II / III) are NOT used as defaults.
+Pasted text, stdin, and --text do not call Gemini and cannot fill
+fields: there is no page image.
+
+Model id: gemini-3.8-flash. The key is read from the environment at
+call time under the name GEMINI_API_KEY. It is never written here.
 """
 
 from __future__ import annotations
@@ -20,803 +23,11 @@ import re
 import subprocess
 import sys
 import tempfile
+import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import Any
 
-Leaf = dict[str, Any]
-
-FREQUENCY_SLOTS = (
-    "exams",
-    "cleanings",
-    "bitewings",
-    "full_mouth_or_panoramic",
-    "fluoride",
-    "sealants",
-    "space_maintainers",
-    "fillings",
-    "crowns",
-    "dentures",
-    "bridges",
-    "implants",
-    "root_canal",
-    "periodontal_surgery",
-    "scaling_and_root_planing",
-    "periodontal_maintenance",
-)
-
-FREQUENCY_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
-    ("exams", re.compile(r"(?i)\boral\s+evaluations?\b|\boral\s+exams?\b|\bperiodic\s+(?:oral\s+)?exams?\b|\bexams?\b")),
-    ("cleanings", re.compile(r"(?i)\bcleanings?\b|\bprophylaxis\b|\bprophy\b")),
-    ("bitewings", re.compile(r"(?i)\bbite[\s-]?wings?\b")),
-    ("full_mouth_or_panoramic", re.compile(r"(?i)\bfull[\s-]?mouth\b|\bpanoramic\b|\bcomplete\s+series\b")),
-    ("fluoride", re.compile(r"(?i)\bfluoride\b")),
-    ("sealants", re.compile(r"(?i)\bsealants?\b")),
-    ("space_maintainers", re.compile(r"(?i)\bspace\s+maintainers?\b")),
-    ("fillings", re.compile(r"(?i)\bfillings?\b")),
-    ("crowns", re.compile(r"(?i)\bcrowns?\b")),
-    ("dentures", re.compile(r"(?i)\bdentures?\b")),
-    ("bridges", re.compile(r"(?i)\bbridges?\b")),
-    ("implants", re.compile(r"(?i)\bimplants?\b")),
-    ("root_canal", re.compile(r"(?i)\broot\s+canals?\b")),
-    ("periodontal_surgery", re.compile(r"(?i)\bperiodontal\s+surgery\b")),
-    ("scaling_and_root_planing", re.compile(r"(?i)\bscaling\s+and\s+root\s+planing\b|\bscaling\s*&\s*root\s+planing\b|\broot\s+planing\b")),
-    ("periodontal_maintenance", re.compile(r"(?i)\bperiodontal\s+maintenance\b|\bperio\s+maintenance\b")),
-]
-
-FREQ_SIGNAL = re.compile(
-    r"(?i)("
-    r"\d+\s+every\s+\d+\s*(?:months?|years?)"
-    r"|\d+\s*(?:times\s*)?per\s+(?:calendar\s+|contract\s+|plan\s+)?year"
-    r"|twice\s+per\s+(?:calendar\s+|contract\s+|plan\s+)?year"
-    r"|two\s+per\s+(?:calendar\s+|contract\s+|plan\s+)?year"
-    r"|once\s+every\s+\d+\s*(?:months?|years?)"
-    r"|once\s+in\s+(?:a\s+|each\s+)?(?:calendar\s+|contract\s+|plan\s+)?year"
-    r"|every\s+\d+\s*(?:months?|years?)"
-    r"|once\s+per\s+\S(?:.*\S)?"
-    r"|limited\s+to\s+\S(?:.*\S)?"
-    r"|one\s+per\s+\S(?:.*\S)?"
-    r")"
-)
-
-AGE_RE = re.compile(
-    r"(?i)("
-    r"(?:through|thru|under|up to)\s+age\s+\d{1,2}"
-    r"|age\s+\d{1,2}\s+and\s+(?:under|younger)"
-    r"|ages?\s+\d{1,2}\s*[-–]\s*\d{1,2}"
-    r"|to\s+age\s+\d{1,2}"
-    r")"
-)
-
-REPL_RE = re.compile(r"(?i)(replac(?:e|ed|ement|ing)\b[^\n]{0,60})")
-
-MONEY_RE = re.compile(r"\$\d[\d,]*(?:\.\d{2})?")
-PCT_RE = re.compile(r"\d{1,3}\s*%")
-IN_RE = re.compile(r"(?i)in[-\s]?network")
-OUT_RE = re.compile(r"(?i)out[-\s]of[-\s]?network")
-PER_PERSON_RE = re.compile(
-    r"(?i)\bper\s+(?:eligible\s+|insured\s+|covered\s+)?person\b|\bper\s+person\b|\beach\s+covered\s+person\b"
-)
-PERIOD_PATTERNS = (
-    re.compile(r"(?i)contract\s+year"),
-    re.compile(r"(?i)calendar\s+year"),
-    re.compile(r"(?i)\bannual\b"),
-)
-
-PLAN_TYPE_RE = re.compile(
-    r"(?i)("
-    r"\bthis\s+is\s+an?\s+(?:PPO|DHMO|indemnity)\s+plan\b"
-    r"|\b(?:PPO|DHMO|indemnity)\s+plan\b"
-    r"|\bplan\s+type\s*[:\-]\s*(?:PPO|DHMO|indemnity)\b"
-    r"|\b(?:PPO|DHMO|indemnity)\s+dental\s+plan\b"
-    r")"
-)
-PLAN_TOKEN_RE = re.compile(r"(?i)\b(PPO|DHMO|indemnity)\b")
-
-
-def empty_leaf() -> Leaf:
-    return {"status": "not_found", "value": None, "evidence": None}
-
-
-def is_leaf(obj: Any) -> bool:
-    return isinstance(obj, dict) and set(obj.keys()) == {"status", "value", "evidence"}
-
-
-def iter_leaves(obj: Any, path: str = ""):
-    if is_leaf(obj):
-        yield path, obj
-        return
-    if isinstance(obj, dict):
-        for key, value in obj.items():
-            child = f"{path}.{key}" if path else str(key)
-            yield from iter_leaves(value, child)
-
-
-def number_tokens(value: Any) -> list[str]:
-    if isinstance(value, bool) or value is None:
-        return []
-    if isinstance(value, (int, float)):
-        return [str(value)]
-    return re.findall(r"\d[\d,]*", str(value))
-
-
-def make_found(source: str, evidence: str | None, value: Any) -> Leaf:
-    if not isinstance(evidence, str) or evidence == "" or evidence not in source:
-        return empty_leaf()
-    if value is None or isinstance(value, bool):
-        return empty_leaf()
-    if isinstance(value, str):
-        if value == "" or value not in evidence:
-            return empty_leaf()
-    for tok in number_tokens(value):
-        if tok not in evidence:
-            return empty_leaf()
-    return {"status": "found", "value": value, "evidence": evidence}
-
-
-def set_if_empty(slot: Leaf, source: str, evidence: str | None, value: Any) -> None:
-    if slot.get("status") == "found":
-        return
-    found = make_found(source, evidence, value)
-    if found["status"] == "found":
-        slot.clear()
-        slot.update(found)
-
-
-def validate_fields(fields: dict[str, Any], source: str) -> None:
-    for _, leaf in iter_leaves(fields):
-        if leaf.get("status") != "found":
-            leaf["status"] = "not_found"
-            leaf["value"] = None
-            leaf["evidence"] = None
-            continue
-        checked = make_found(source, leaf.get("evidence"), leaf.get("value"))
-        leaf.clear()
-        leaf.update(checked)
-
-
-def skeleton() -> dict[str, Any]:
-    frequencies = {
-        name: {
-            "frequency": empty_leaf(),
-            "age_limit": empty_leaf(),
-            "replacement_period": empty_leaf(),
-        }
-        for name in FREQUENCY_SLOTS
-    }
-    return {
-        "cost_share": {
-            "in_network": empty_leaf(),
-            "out_of_network": empty_leaf(),
-            "second_network": empty_leaf(),
-        },
-        "annual_or_contract_maximum": {
-            "amount_per_person": empty_leaf(),
-            "period": empty_leaf(),
-        },
-        "annual_maximum_carryover": empty_leaf(),
-        "deductible": {
-            "per_person": empty_leaf(),
-            "family_maximum": empty_leaf(),
-            "waived_for_diagnostic_and_preventive": empty_leaf(),
-            "waived_for_orthodontics": empty_leaf(),
-        },
-        "plan_pay_percent_by_class": {},
-        "diagnostic_preventive_excluded_from_annual_maximum": empty_leaf(),
-        "orthodontics": {
-            "lifetime_maximum": empty_leaf(),
-            "adult_eligibility": empty_leaf(),
-            "child_eligibility": empty_leaf(),
-            "one_course_per_lifetime": empty_leaf(),
-        },
-        "waiting_periods": {
-            "collection": empty_leaf(),
-            "by_class": {},
-        },
-        "frequencies": frequencies,
-        "implants": empty_leaf(),
-        "alternate_benefit_or_least_costly_treatment": empty_leaf(),
-        "cosmetic_exclusion": empty_leaf(),
-        "missing_tooth_clause": empty_leaf(),
-        "tmj": empty_leaf(),
-        "coordination_of_benefits": empty_leaf(),
-        "allowed_amount_basis": empty_leaf(),
-        "pretreatment_estimate": empty_leaf(),
-        "dependent_age": empty_leaf(),
-        "plan_type": empty_leaf(),
-    }
-
-
-def nonempty_line_starts(text: str, money_start: int, lookback: int = 4) -> int:
-    line_start = text.rfind("\n", 0, money_start) + 1
-    starts = [line_start]
-    cursor = line_start
-    found = 0
-    while found < lookback and cursor > 0:
-        prev = text.rfind("\n", 0, cursor - 1) + 1
-        segment = text[prev: cursor - 1]
-        cursor = prev
-        if segment.strip():
-            starts.append(prev)
-            found += 1
-        if prev == 0:
-            break
-    return min(starts)
-
-
-def lines_between(text: str, start: int, end: int) -> list[tuple[int, str]]:
-    out: list[tuple[int, str]] = []
-    cursor = start
-    while cursor < end:
-        newline = text.find("\n", cursor, end)
-        if newline == -1:
-            newline = end
-        segment = text[cursor:newline]
-        if segment.strip():
-            out.append((cursor, segment))
-        if newline == end:
-            break
-        cursor = newline + 1
-    return out
-
-
-def classify_money(lines: list[tuple[int, str]]) -> tuple[str | None, int | None]:
-    if not lines:
-        return None, None
-    last = lines[-1][1]
-    texts = [seg for _, seg in lines]
-    for offset, seg in reversed(lines):
-        if re.search(r"(?i)carry[-\s]?over|\brollover\b", seg):
-            return "carryover", offset
-        if re.search(r"(?i)orthodont", seg):
-            return "ortho_lifetime", offset
-        if re.search(r"(?i)\bdeductible\b", seg):
-            if re.search(r"(?i)\bfamily\b", seg) or re.search(r"(?i)\bfamily\b", last):
-                return "family_deductible", offset
-            return "person_deductible", offset
-        if re.search(r"(?i)\bmaximum\b", seg):
-            familyish = re.search(r"(?i)\bfamily\b", seg) or re.search(r"(?i)\bfamily\b", last)
-            if familyish:
-                if any(re.search(r"(?i)\bdeductible\b", s) for s in texts):
-                    return "family_deductible", offset
-                return None, None
-            if PER_PERSON_RE.search(last) or PER_PERSON_RE.search(seg):
-                return "annual_max", offset
-            return None, None
-    return None, None
-
-
-def period_phrase(scope: str) -> str | None:
-    for pattern in PERIOD_PATTERNS:
-        matches = list(pattern.finditer(scope))
-        if matches:
-            return matches[-1].group(0)
-    return None
-
-
-def parse_money(text: str, fields: dict[str, Any]) -> None:
-    targets = {
-        "annual_max": fields["annual_or_contract_maximum"]["amount_per_person"],
-        "person_deductible": fields["deductible"]["per_person"],
-        "family_deductible": fields["deductible"]["family_maximum"],
-        "ortho_lifetime": fields["orthodontics"]["lifetime_maximum"],
-        "carryover": fields["annual_maximum_carryover"],
-    }
-    for match in MONEY_RE.finditer(text):
-        scope_start = nonempty_line_starts(text, match.start(), 4)
-        lined = lines_between(text, scope_start, match.end())
-        kind, trigger = classify_money(lined)
-        if kind is None or trigger is None or kind not in targets:
-            continue
-        slot = targets[kind]
-        if slot["status"] == "found":
-            continue
-        evidence = text[trigger: match.end()]
-        value = match.group(0)
-        set_if_empty(slot, text, evidence, value)
-        if kind == "annual_max" and fields["annual_or_contract_maximum"]["period"]["status"] != "found":
-            phrase = period_phrase(evidence)
-            if phrase:
-                set_if_empty(fields["annual_or_contract_maximum"]["period"], text, phrase, phrase)
-
-
-def parse_carryover_phrase(text: str, fields: dict[str, Any]) -> None:
-    slot = fields["annual_maximum_carryover"]
-    if slot["status"] == "found":
-        return
-    match = re.search(
-        r"(?i)((?:annual\s+)?maximum\s+carry[-\s]?over\s*(?:yes|no)?|\brollover\b\s*(?:yes|no)?)",
-        text,
-    )
-    if not match:
-        return
-    evidence = match.group(0)
-    yn = re.search(r"(?i)\b(yes|no)\b", evidence)
-    if yn:
-        value = yn.group(0)
-    else:
-        word = re.search(r"(?i)carry[-\s]?over|rollover", evidence)
-        value = word.group(0) if word else evidence
-    set_if_empty(slot, text, evidence, value)
-
-
-def _waiver_value(snippet: str) -> str | None:
-    column = re.search(r"(?i)(?:\s{2,}|\t)(yes|no)\s*$", snippet)
-    if column:
-        return column.group(1)
-    waived = re.search(r"(?i)\bwaived\b", snippet)
-    if waived:
-        return waived.group(0)
-    subject = re.search(r"(?i)not subject to(?:\s+the)?\s+deductible", snippet)
-    if subject:
-        return subject.group(0)
-    return None
-
-
-def parse_waivers(text: str, fields: dict[str, Any]) -> None:
-    patterns = [
-        re.compile(r"(?i)(?:\bdeductible\b[^\n]{0,60}\bwaived\b|\bwaived\b[^\n]{0,60}\bdeductible\b)[^\n]*"),
-        re.compile(
-            r"(?i)[^\n]*(?:diagnostic|preventive)[^\n]{0,100}not subject to[^\n]{0,40}deductible[^\n]*"
-        ),
-    ]
-    spans: list[tuple[int, int]] = []
-    for pattern in patterns:
-        for match in pattern.finditer(text):
-            spans.append((match.start(), match.end()))
-    for start, end in spans:
-        snippet_end = end
-        snippet = text[start:end]
-        core = re.sub(r"(?i)(?:\s{2,}(?:yes|no))+\s*$", "", snippet).rstrip()
-        if re.search(r"(?i)\band\s*(?:yes|no)?\s*$", core):
-            nxt = re.match(r"\s*\n([^\n]*)", text[end:])
-            if (
-                nxt
-                and re.search(r"(?i)orthodont", nxt.group(1))
-                and not re.search(r"(?i)maximum|\$|%", nxt.group(1))
-                and len(nxt.group(1).strip()) <= 80
-            ):
-                snippet_end = end + nxt.end()
-                snippet = text[start:snippet_end]
-        value = _waiver_value(snippet)
-        if not value:
-            continue
-        if re.search(r"(?i)diagnostic|preventive", snippet):
-            set_if_empty(fields["deductible"]["waived_for_diagnostic_and_preventive"], text, snippet, value)
-        if re.search(r"(?i)orthodont", snippet):
-            set_if_empty(fields["deductible"]["waived_for_orthodontics"], text, snippet, value)
-
-
-def parse_dp_excluded(text: str, fields: dict[str, Any]) -> None:
-    match = re.search(
-        r"(?i)([^\n]*diagnostic[^\n]{0,50}preventive[^\n]{0,90}(?:do not|does not|don't|not)\s+apply[^\n]{0,70}maximum[^\n]*)",
-        text,
-    )
-    if not match:
-        return
-    evidence = match.group(0)
-    phrase = re.search(r"(?i)do not apply|does not apply|don't apply|not apply", evidence)
-    if not phrase:
-        return
-    set_if_empty(fields["diagnostic_preventive_excluded_from_annual_maximum"], text, evidence, phrase.group(0))
-
-
-def _plausible_network_name(name: str) -> bool:
-    if not (2 <= len(name) <= 40):
-        return False
-    words = name.split()
-    if not words or len(words) > 5:
-        return False
-    if not re.search(r"[A-Za-z]", name):
-        return False
-    if re.search(r"(?i)pays|coinsurance|glance|maximum|deductible|benefit|summary|services|person|%|\$|\bplan\b", name):
-        return False
-    if re.fullmatch(r"(?i)(yes|no)", name):
-        return False
-    return True
-
-
-def best_network_header(text: str):
-    best = None
-    for line in text.splitlines():
-        found = []
-        for match in re.finditer(r"(?i)in[-\s]?network|out[-\s]of[-\s]?network", line):
-            raw = match.group(0)
-            kind = "in_network" if raw.lower().replace(" ", "").startswith("in") else "out_of_network"
-            found.append((match.start(), match.end(), kind, raw))
-        kinds = {item[2] for item in found}
-        if "in_network" not in kinds or "out_of_network" not in kinds:
-            continue
-        found.sort()
-        items = [(start, end, kind, raw) for start, end, kind, raw in found]
-        extras = []
-        for idx in range(len(found) - 1):
-            gap = line[found[idx][1]: found[idx + 1][0]].strip()
-            if _plausible_network_name(gap):
-                extras.append((found[idx][1], found[idx + 1][0], "second_network", gap))
-        if len(extras) > 1:
-            extras = []
-        merged = [(start, kind, raw) for start, _, kind, raw in items]
-        for start, _, kind, raw in extras:
-            merged.append((start, kind, raw))
-        merged.sort()
-        order = [kind for _, kind, _ in merged]
-        second = next((raw for _, kind, raw in merged if kind == "second_network"), None)
-        in_raw = next(raw for _, kind, raw in merged if kind == "in_network")
-        out_raw = next(raw for _, kind, raw in merged if kind == "out_of_network")
-        leftover = line
-        for raw in (in_raw, out_raw):
-            leftover = re.sub(re.escape(raw), " ", leftover, count=1)
-        if second:
-            leftover = leftover.replace(second, " ")
-        score = (len(leftover.split()), len(line))
-        cand = (score, order, second, in_raw, out_raw, line)
-        if best is None or cand[0] < best[0]:
-            best = cand
-    return best
-
-
-def clean_class_label(raw: str) -> str | None:
-    label = re.sub(r"^[\s*•·\-\u2022\u2013\u2014|]+", "", raw)
-    label = re.sub(r"[\s|]+$", "", label)
-    label = re.sub(r"\s+", " ", label).strip(" :.-")
-    if not label or len(label) < 3 or len(label) > 70:
-        return None
-    if len(label.split()) > 8:
-        return None
-    if re.search(r"(?i)\$|waiting period|limited to|per year|per tooth|deductible|\bmaximum\b|phone|example|customer service", label):
-        return None
-    if re.fullmatch(r"(?i)in[-\s]?network|out[-\s]of[-\s]?network", label):
-        return None
-    if re.search(r"(?i)\b(allows|balance billed|total cost|this example)\b", label):
-        return None
-    return label
-
-
-def class_bucket(order: list[str], second_name: str | None) -> dict[str, Leaf]:
-    bucket = {
-        "in_network": empty_leaf(),
-        "out_of_network": empty_leaf(),
-    }
-    if second_name or "second_network" in order:
-        bucket["second_network"] = empty_leaf()
-    return bucket
-
-
-def parse_classes(text: str, fields: dict[str, Any]) -> None:
-    header = best_network_header(text)
-    order: list[str] = []
-    second = None
-    if header:
-        _, order, second, in_raw, out_raw, _line = header
-        set_if_empty(fields["cost_share"]["in_network"], text, in_raw, in_raw)
-        set_if_empty(fields["cost_share"]["out_of_network"], text, out_raw, out_raw)
-        if second:
-            set_if_empty(fields["cost_share"]["second_network"], text, second, second)
-    classes: dict[str, dict[str, Leaf]] = fields["plan_pay_percent_by_class"]
-    explicit = re.compile(
-        r"(?i)^(?P<label>.+?)\s+in[-\s]?network\s*(?P<inn>\d{1,3}\s*%)\s+"
-        r"(?:(?P<second>[A-Za-z][^%\n]{1,30}?)\s+(?P<sp>\d{1,3}\s*%)\s+)?"
-        r"out[-\s]of[-\s]?network\s*(?P<oon>\d{1,3}\s*%)\s*$"
-    )
-    for line in text.splitlines():
-        stripped = line.strip()
-        if not stripped:
-            continue
-        exp = explicit.match(stripped)
-        if exp:
-            label = clean_class_label(exp.group("label"))
-            if not label or label in classes:
-                continue
-            bucket = class_bucket(order or ["in_network", "out_of_network"], exp.group("second"))
-            inn = exp.group("inn")
-            oon = exp.group("oon")
-            bucket["in_network"] = make_found(text, line, inn)
-            bucket["out_of_network"] = make_found(text, line, oon)
-            if exp.group("second") and exp.group("sp") and _plausible_network_name(exp.group("second").strip()):
-                sname = exp.group("second").strip()
-                bucket["second_network"] = make_found(text, line, exp.group("sp"))
-                set_if_empty(fields["cost_share"]["second_network"], text, sname, sname)
-            in_match = IN_RE.search(line)
-            out_match = OUT_RE.search(line)
-            if in_match:
-                set_if_empty(fields["cost_share"]["in_network"], text, in_match.group(0), in_match.group(0))
-            if out_match:
-                set_if_empty(fields["cost_share"]["out_of_network"], text, out_match.group(0), out_match.group(0))
-            if bucket["in_network"]["status"] == "found" and bucket["out_of_network"]["status"] == "found":
-                classes[label] = bucket
-            continue
-        pcts = list(PCT_RE.finditer(line))
-        if not pcts or not order or len(pcts) != len(order):
-            continue
-        label = clean_class_label(line[: pcts[0].start()])
-        if not label or label in classes:
-            continue
-        bucket = class_bucket(order, second)
-        ok = True
-        for kind, pct in zip(order, pcts):
-            leaf = make_found(text, line, pct.group(0))
-            if leaf["status"] != "found":
-                ok = False
-                break
-            bucket[kind] = leaf
-        if ok:
-            classes[label] = bucket
-
-
-def previous_nonempty(text: str, line_start: int) -> tuple[int | None, str]:
-    cursor = line_start
-    while cursor > 0:
-        prev = text.rfind("\n", 0, cursor - 1) + 1
-        segment = text[prev: cursor - 1]
-        if segment.strip():
-            return prev, segment
-        if prev == 0:
-            break
-        cursor = prev
-    return None, ""
-
-
-def parse_ortho_eligibility(text: str, fields: dict[str, Any]) -> None:
-    ortho = fields["orthodontics"]
-    offset = 0
-    for line in text.splitlines(keepends=True):
-        body = line[:-1] if line.endswith("\n") else line
-        start = offset
-        offset += len(line)
-        if not body.strip():
-            continue
-        own = bool(re.search(r"(?i)orthodont", body))
-        prev_start, prev_seg = previous_nonempty(text, start)
-        short_follow = (
-            not own
-            and prev_start is not None
-            and len(body.strip()) <= 100
-            and "$" not in body
-            and "%" not in body
-            and bool(re.search(r"(?i)orthodont", prev_seg))
-            and bool(re.search(r"(?i)child|adult|one course", body))
-        )
-        if not own and not short_follow:
-            continue
-        evidence = body if own or prev_start is None else text[prev_start: start + len(body)]
-        child = re.search(r"(?i)(children only|child only|dependent children|adults and dependent children)", body)
-        if child and re.search(r"(?i)child", child.group(0)):
-            set_if_empty(ortho["child_eligibility"], text, evidence, child.group(0))
-        adult = re.search(r"(?i)(\badults?\b(?:\s+and\s+dependent\s+children)?|adults?\s+only)", body)
-        if adult:
-            set_if_empty(ortho["adult_eligibility"], text, evidence, adult.group(0))
-        course = re.search(r"(?i)(one course\b[^\n]{0,70})", body)
-        if course:
-            set_if_empty(ortho["one_course_per_lifetime"], text, evidence, course.group(0).strip())
-
-
-def parse_waiting(text: str, fields: dict[str, Any]) -> None:
-    mention = re.search(r"(?i)waiting\s+periods?", text)
-    if not mention:
-        return
-    set_if_empty(fields["waiting_periods"]["collection"], text, mention.group(0), mention.group(0))
-    by_class = fields["waiting_periods"]["by_class"]
-    labeled = re.compile(
-        r"(?i)^(?P<label>[A-Za-z][^:\n]{1,60}?)\s*:\s*"
-        r"(?P<dur>\d{1,3}\s*-\s*months?|\d{1,3}\s*-\s*years?|\d{1,3}\s+months?|\d{1,3}\s+years?)"
-    )
-    trailing = re.compile(
-        r"(?i)(?P<dur>\d{1,3}\s*-\s*months?|\d{1,3}\s*-\s*years?|\d{1,3}\s+months?|\d{1,3}\s+years?)"
-        r"\s+waiting\s+period\s+(?:on|for)\s+(?P<label>[A-Za-z][^.\n]{1,60})"
-    )
-    for line in text.splitlines():
-        if not re.search(r"(?i)waiting", line):
-            continue
-        match = labeled.match(line.strip())
-        if not match:
-            match = trailing.search(line)
-        if not match:
-            continue
-        label = clean_class_label(match.group("label"))
-        if not label or label in by_class:
-            continue
-        if re.search(r"(?i)waiting", label):
-            continue
-        dur = match.group("dur")
-        leaf = make_found(text, line, dur)
-        if leaf["status"] == "found":
-            by_class[label] = leaf
-
-
-def parse_frequencies(text: str, fields: dict[str, Any]) -> None:
-    for line in text.splitlines():
-        if not line.strip():
-            continue
-        if PCT_RE.search(line) and not FREQ_SIGNAL.search(line):
-            continue
-        if not FREQ_SIGNAL.search(line):
-            continue
-        evidence = line.strip()
-        if evidence not in text:
-            evidence = line
-        for slot, pattern in FREQUENCY_PATTERNS:
-            bucket = fields["frequencies"][slot]
-            if bucket["frequency"]["status"] == "found":
-                continue
-            if not pattern.search(line):
-                continue
-            set_if_empty(bucket["frequency"], text, evidence, evidence)
-            age = AGE_RE.search(line)
-            if age:
-                set_if_empty(bucket["age_limit"], text, evidence, age.group(0))
-            repl = REPL_RE.search(line)
-            if repl:
-                set_if_empty(bucket["replacement_period"], text, evidence, repl.group(0).strip())
-
-
-def line_at(text: str, start: int, end: int) -> str:
-    ls = text.rfind("\n", 0, start) + 1
-    le = text.find("\n", end)
-    if le == -1:
-        le = len(text)
-    return text[ls:le]
-
-
-def parse_implants(text: str, fields: dict[str, Any]) -> None:
-    for match in re.finditer(r"(?i)implant", text):
-        line = line_at(text, match.start(), match.end())
-        window = line
-        status = re.search(
-            r"(?i)(not covered|excluded|limited|covered)",
-            window,
-        )
-        if not status:
-            continue
-        # Status word must sit near the implant word on this line.
-        impl = re.search(r"(?i)implant\w*", window)
-        if not impl:
-            continue
-        if abs(impl.start() - status.start()) > 50:
-            continue
-        if status.group(0).lower() == "covered" and re.search(r"(?i)not covered", window):
-            status = re.search(r"(?i)not covered", window)
-        value = status.group(0)
-        set_if_empty(fields["implants"], text, window.strip() if window.strip() in text else window, value)
-        if fields["implants"]["status"] == "found":
-            return
-
-
-def parse_named_provisions(text: str, fields: dict[str, Any]) -> None:
-    rules = [
-        (
-            "alternate_benefit_or_least_costly_treatment",
-            re.compile(r"(?i)(alternate benefit|alternative benefit|least costly(?:\s+\w+){0,4}|least expensive(?:\s+\w+){0,4})"),
-        ),
-        (
-            "cosmetic_exclusion",
-            re.compile(r"(?i)(cosmetic(?:\s+\w+){0,6})"),
-        ),
-        (
-            "missing_tooth_clause",
-            re.compile(r"(?i)(missing tooth(?:\s+\w+){0,6})"),
-        ),
-        (
-            "tmj",
-            re.compile(r"(?i)(\bTMJ\b|temporomandibular(?:\s+\w+){0,4})"),
-        ),
-        (
-            "coordination_of_benefits",
-            re.compile(r"(?i)(coordination of benefits|\bCOB\b)"),
-        ),
-        (
-            "allowed_amount_basis",
-            re.compile(
-                r"(?i)(usual,?\s+and\s+customary|\bUCR\b|maximum allowable charge|\bMAC\b|"
-                r"maximum allowed (?:cost|amount|charge)|allowed amount|fee schedule|"
-                r"\d{1,3}(?:st|nd|rd|th)\s+percentile)"
-            ),
-        ),
-        (
-            "pretreatment_estimate",
-            re.compile(r"(?i)(pre[-\s]?treatment estimate|predetermination|pre[-\s]?estimate)"),
-        ),
-        (
-            "dependent_age",
-            re.compile(
-                r"(?i)((?:eligible\s+)?dependents?(?:\s+child(?:ren)?)?[^.\n]{0,40}(?:through age|to age|under age|age)\s*\d{1,2}"
-                r"|limiting age[^.\n]{0,20}\d{1,2})"
-            ),
-        ),
-    ]
-    for key, pattern in rules:
-        match = pattern.search(text)
-        if not match:
-            continue
-        value = match.group(1)
-        line = line_at(text, match.start(1), match.end(1))
-        evidence = line if value in line else value
-        set_if_empty(fields[key], text, evidence, value)
-
-
-def parse_plan_type(text: str, fields: dict[str, Any]) -> None:
-    found: list[tuple[str, str]] = []
-    seen = set()
-    for match in PLAN_TYPE_RE.finditer(text):
-        token_match = PLAN_TOKEN_RE.search(match.group(0))
-        if not token_match:
-            continue
-        token = token_match.group(0)
-        seen.add(token.upper())
-        line = line_at(text, match.start(), match.end())
-        found.append((token, line if token in line else match.group(0)))
-    if len(seen) != 1 or not found:
-        return
-    token, evidence = found[0]
-    set_if_empty(fields["plan_type"], text, evidence, token)
-
-
-def build_summary(fields: dict[str, Any]) -> str:
-    found_lines = []
-    missing_lines = []
-    for path, leaf in iter_leaves(fields):
-        if leaf["status"] == "found":
-            shown = leaf["value"]
-            if isinstance(shown, str):
-                shown = shown.replace("\n", " ")
-            found_lines.append(f"- {path}: {shown}")
-        else:
-            missing_lines.append(f"- {path}")
-    found_lines.sort()
-    missing_lines.sort()
-    parts = ["Found:"]
-    parts.extend(found_lines or ["- (none)"])
-    parts.append("Not found:")
-    parts.extend(missing_lines or ["- (none)"])
-    return "\n".join(parts)
-
-
-def collect_notes(fields: dict[str, Any]) -> list[str]:
-    notes: list[str] = []
-    seen = set()
-    for _, leaf in iter_leaves(fields):
-        if leaf["status"] != "found":
-            continue
-        evidence = leaf["evidence"]
-        if evidence in seen:
-            continue
-        seen.add(evidence)
-        notes.append(evidence)
-    return notes
-
-
-def extract_text(text: str) -> dict[str, Any]:
-    fields = skeleton()
-    parse_classes(text, fields)
-    parse_money(text, fields)
-    parse_carryover_phrase(text, fields)
-    parse_waivers(text, fields)
-    parse_dp_excluded(text, fields)
-    parse_ortho_eligibility(text, fields)
-    parse_waiting(text, fields)
-    parse_frequencies(text, fields)
-    parse_implants(text, fields)
-    parse_named_provisions(text, fields)
-    parse_plan_type(text, fields)
-    validate_fields(fields, text)
-    # Drop class buckets that failed validation entirely.
-    cleaned = {}
-    for name, bucket in fields["plan_pay_percent_by_class"].items():
-        if any(leaf["status"] == "found" for leaf in bucket.values() if is_leaf(leaf)):
-            cleaned[name] = bucket
-    fields["plan_pay_percent_by_class"] = cleaned
-    return {
-        "ok": True,
-        "fields": fields,
-        "notes": collect_notes(fields),
-        "readable_summary": build_summary(fields),
-    }
-
-
-
-# Gemini vision. Each rendered page image is sent when calls are enabled.
-# https://ai.google.dev/gemini-api/docs/models/gemini-3.8-flash
-# Current stable Flash model. Inputs include images. Output is text.
-# Image-generation Flash ids are a different task and are not used.
 CALLS_ENABLED = True
 GEMINI_MODEL = "gemini-3.8-flash"
 GEMINI_URL = (
@@ -825,194 +36,1024 @@ GEMINI_URL = (
     + ":generateContent"
 )
 
-GEMINI_PROMPT = """You are reading page images of one dental benefit summary. Return a single JSON object and nothing else. The object has a "fields" member and no other top-level members.
+TEXT_ONLY_REASON = "only a PDF page-image read can fill fields"
 
-Each leaf is {"status": "found", "value": "<printed text>", "evidence": "<verbatim quote from the page>"} or {"status": "not_found", "value": null, "evidence": null}.
+NETWORK_GROUPS = (
+    "annual_maximum",
+    "deductible_individual",
+    "deductible_family",
+    "deductible_unlabeled",
+    "preventive",
+    "basic",
+    "major",
+    "endodontics",
+    "periodontics",
+    "oral_surgery",
+)
+SINGLE_FIELDS = (
+    "carrier",
+    "plan_name",
+    "plan_type",
+    "preventive_deductible_waived",
+    "ortho_lifetime_max",
+    "ortho_coinsurance_or_copay",
+    "ortho_age_limit",
+    "out_of_network_basis",
+)
+WAITING_FIELDS = ("basic", "major", "ortho")
+CLASS_FIELDS = (
+    "preventive",
+    "basic",
+    "major",
+    "endodontics",
+    "periodontics",
+    "oral_surgery",
+)
+ASSIGNABLE = ("endodontics", "periodontics", "oral_surgery")
 
-quote the page verbatim in evidence, and if it is not printed, status not_found.
+IN_RE = re.compile(r"(?i)\bin[-\s]?network\b")
+OUT_RE = re.compile(r"(?i)\bout[-\s]of[-\s]?network\b")
+PCT_RE = re.compile(r"(?<![\d.])(\d{1,3}(?:\.\d+)?)\s*%")
+SLASH_RE = re.compile(
+    r"(?<![\d./])(\d{1,3})\s*/\s*(\d{1,3})\s*/\s*(\d{1,3})(?:\s*/\s*(\d{1,3}))?(?!\s*/)"
+)
+DOLLAR_RE = re.compile(r"\$\s*(\d{1,3}(?:,\d{3})+|\d+)(?:\.(\d{2}))?")
+MEMBER_PHRASE_RE = re.compile(
+    r"(?i)\b(?:you|member|patient)\s+pays?\s+\d{1,3}(?:\.\d+)?\s*%"
+)
+PLAN_PHRASE_RE = re.compile(
+    r"(?i)\b(?:plan|insurance|we)\s+pays?\s+\d{1,3}(?:\.\d+)?\s*%"
+)
+ASSIGN_RE = re.compile(
+    r"(?i)\b(?:paid|payable|covered|pay)\s+as\s+(preventive|basic|major)\b"
+    r"|\bsame\s+as\s+(preventive|basic|major)\b"
+)
+PLAN_TYPE_RE = re.compile(
+    r"(?i)\b(DHMO|DPPO|DMO|PPO|indemnity|EPO|POS|HMO|FFS)\b|fee-for-service"
+)
+AGE_RE = re.compile(
+    r"(?i)(?:through|thru|until|to|under|up to)\s+age\s*(\d{1,2})"
+    r"|age\s*(\d{1,2})"
+    r"|(\d{1,2})\s*(?:years?\s+of\s+age|years?\s+old)"
+)
+NO_AGE_RE = re.compile(r"(?i)\bno\s+age\s+limit\b")
+MONTH_RE = re.compile(r"(?i)\b(\d{1,3})\s*-?\s*months?\b")
+YEAR_RE = re.compile(r"(?i)\b(\d{1,3})\s*-?\s*years?\b")
+WAITING_NONE_RE = re.compile(r"(?i)\b(?:none|waived|no\s+waiting(?:\s+period)?)\b")
+ANNUAL_RE = re.compile(r"(?i)\bannual\b|\bcalendar\s+year\b|\bper\s+year\b|\byearly\b")
+LIFETIME_RE = re.compile(r"(?i)\blifetime\b")
+MAXIMUM_RE = re.compile(r"(?i)\bmax(?:imum)?\b")
+ORTHO_RE = re.compile(r"(?i)\borthodont")
+FAMILY_RE = re.compile(r"(?i)\bfamily\b")
+PERSON_RE = re.compile(
+    r"(?i)\bper\s+person\b|\bindividual\b|\bper\s+member\b|\beach\s+(?:covered\s+)?person\b"
+)
+DEDUCTIBLE_RE = re.compile(r"(?i)\bdeductible\b")
+WAIVED_RE = re.compile(r"(?i)\bwaiv\w*\b")
+APPLIES_RE = re.compile(r"(?i)\bapplies\b")
+PREVENTIVE_WORD_RE = re.compile(r"(?i)\bpreventiv\w*\b|\bdiagnostic\b")
+PROCEDURE_RE = re.compile(r"\bD\d{4}\b")
+BASIS_RE = re.compile(
+    r"(?i)\bbasis\b|\bucr\b|\bmac\b|\bpercentile\b|\bfee\s+schedule\b|"
+    r"\breasonable\s+and\s+customary\b|\busual\s+and\s+customary\b|"
+    r"\ballowed\s+amount\b|\ballowable\s+charge\b"
+)
 
-Do not infer, calculate, or fill any field from general dental knowledge. Do not rename printed class names and do not map them onto NADP class numbers. Use only the class name printed on the page.
+CLASS_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("oral_surgery", re.compile(r"(?i)\boral\s+surgery\b")),
+    ("endodontics", re.compile(r"(?i)\bendodont(?:ic|ics|ia)?\b|\bendo\b")),
+    ("periodontics", re.compile(r"(?i)\bperiodont(?:ic|ics|ia)?\b|\bperio\b")),
+    ("preventive", re.compile(r"(?i)\bpreventive\b|\bpreventative\b")),
+    ("basic", re.compile(r"(?i)\bbasic\b")),
+    ("major", re.compile(r"(?i)\bmajor\b")),
+)
 
-Use only these slots:
-- cost_share.in_network
-- cost_share.out_of_network
-- cost_share.second_network
-- annual_or_contract_maximum.amount_per_person
-- annual_or_contract_maximum.period
-- annual_maximum_carryover
-- deductible.per_person
-- deductible.family_maximum
-- deductible.waived_for_diagnostic_and_preventive
-- deductible.waived_for_orthodontics
-- plan_pay_percent_by_class.<printed class name>.in_network
-- plan_pay_percent_by_class.<printed class name>.out_of_network
-- plan_pay_percent_by_class.<printed class name>.second_network only when a third network column is printed
-- diagnostic_preventive_excluded_from_annual_maximum
-- orthodontics.lifetime_maximum
-- orthodontics.adult_eligibility
-- orthodontics.child_eligibility
-- orthodontics.one_course_per_lifetime
-- waiting_periods.collection
-- waiting_periods.by_class.<printed class name>
-- frequencies.<slot>.frequency
-- frequencies.<slot>.age_limit
-- frequencies.<slot>.replacement_period
-Frequency slots: exams, cleanings, bitewings, full_mouth_or_panoramic, fluoride, sealants, space_maintainers, fillings, crowns, dentures, bridges, implants, root_canal, periodontal_surgery, scaling_and_root_planing, periodontal_maintenance.
-- implants
-- alternate_benefit_or_least_costly_treatment
-- cosmetic_exclusion
-- missing_tooth_clause
-- tmj
-- coordination_of_benefits
-- allowed_amount_basis
-- pretreatment_estimate
-- dependent_age
-- plan_type
+GEMINI_PROMPT = """You read page images of dental benefit summaries. Return one JSON object and nothing else.
+
+The object is {"plans":[...]} with one element per named plan. In-network and out-of-network are not separate plans. Unlabeled money columns are not a network split: do not write in-network or out-of-network unless those words are printed.
+
+Each quote is {"page": <1-based page number of that image>, "excerpt": "<verbatim text from that page image>"}.
+The excerpt must be copied from the image. Do not invent, paraphrase, or calculate. Include the label words on the line (for example Preventive, Basic, deductible, annual, lifetime), not a bare number. If a line assigns endodontics, periodontics, or oral surgery to another class, the excerpt for that line is only the printed line; do not merge a different line into it. Omit procedure-level copay lists, implants, missing-tooth rules, how often a service is allowed, rollover, takeover, rates, contributions, participation, and network size.
+
+Schema, using placeholders you must replace with verbatim page text or omit when not printed:
+{"plans":[{"carrier":{"page":1,"excerpt":"VERBATIM CARRIER"},"plan_name":{"page":1,"excerpt":"VERBATIM PLAN NAME LINE"},"plan_type":{"page":1,"excerpt":"VERBATIM PLAN TYPE LINE"},"excerpts":[{"page":1,"excerpt":"VERBATIM BENEFIT LINE"}]}]}
+
+Quote, when printed: carrier name, plan name, plan type (only if a type word such as PPO, DHMO, or indemnity is printed), annual maximum, deductibles, preventive/basic/major coinsurance or copay, endodontics, periodontics, oral surgery, whether the preventive deductible is waived or applies, orthodontia lifetime maximum, orthodontia copay or patient cost, orthodontia age limit, waiting periods, and out-of-network basis. Do not copy the placeholders above.
 """
 
 
-def coerce_model_leaf(raw: Any) -> Leaf:
-    """Found only when the model returned a non-empty evidence string.
-
-    Missing or blank evidence is forced to not_found. Values are not
-    invented and the regex parser is not used.
-    """
-    if not isinstance(raw, dict):
-        return empty_leaf()
-    evidence = raw.get("evidence")
-    if not isinstance(evidence, str) or evidence.strip() == "":
-        return empty_leaf()
-    value = raw.get("value")
-    if value is None or isinstance(value, bool):
-        return empty_leaf()
-    if isinstance(value, str) and value.strip() == "":
-        return empty_leaf()
-    return {"status": "found", "value": value, "evidence": evidence}
+def not_found() -> dict[str, Any]:
+    return {"status": "not_found", "value": None, "page": None, "excerpt": None}
 
 
-def _merge_class_map(dest: dict[str, Any], src: Any) -> None:
-    if not isinstance(src, dict):
-        return
-    for label, bucket in src.items():
-        if not isinstance(label, str) or not label.strip() or not isinstance(bucket, dict):
-            continue
-        out = {
-            "in_network": coerce_model_leaf(bucket.get("in_network")),
-            "out_of_network": coerce_model_leaf(bucket.get("out_of_network")),
+def skeleton_fields() -> dict[str, Any]:
+    fields: dict[str, Any] = {}
+    for name in SINGLE_FIELDS:
+        fields[name] = not_found()
+    for name in NETWORK_GROUPS:
+        fields[name] = {
+            "in_network": not_found(),
+            "out_of_network": not_found(),
+            "unlabeled": not_found(),
         }
-        if "second_network" in bucket:
-            out["second_network"] = coerce_model_leaf(bucket.get("second_network"))
-        if any(leaf["status"] == "found" for leaf in out.values()):
-            dest[label] = out
-
-
-def _merge_waiting_classes(dest: dict[str, Any], src: Any) -> None:
-    if not isinstance(src, dict):
-        return
-    for label, leaf in src.items():
-        if isinstance(label, str) and label.strip():
-            dest[label] = coerce_model_leaf(leaf)
-
-
-def _merge_model_tree(dest: dict[str, Any], src: Any) -> None:
-    if not isinstance(src, dict):
-        return
-    for key, dest_value in list(dest.items()):
-        if key not in src:
-            continue
-        src_value = src[key]
-        if is_leaf(dest_value):
-            coerced = coerce_model_leaf(src_value)
-            dest_value.clear()
-            dest_value.update(coerced)
-        elif key == "plan_pay_percent_by_class":
-            _merge_class_map(dest_value, src_value)
-        elif key == "by_class":
-            _merge_waiting_classes(dest_value, src_value)
-        elif isinstance(dest_value, dict):
-            _merge_model_tree(dest_value, src_value)
-
-
-def fields_from_gemini(model_json: Any) -> dict[str, Any]:
-    """Apply the evidence filter to a model JSON object. No regex parser."""
-    fields = skeleton()
-    raw = model_json
-    if isinstance(model_json, dict) and isinstance(model_json.get("fields"), dict):
-        raw = model_json["fields"]
-    if isinstance(raw, dict):
-        _merge_model_tree(fields, raw)
+    fields["waiting_period"] = {name: not_found() for name in WAITING_FIELDS}
     return fields
 
 
-def parse_gemini_response(payload: Any) -> dict[str, Any]:
-    """Parse a generateContent JSON body into filtered fields.
-
-    The model text is JSON only. If it is not JSON, every leaf stays
-    not_found. The regex parser does not see the model text.
-    """
-    if not isinstance(payload, dict):
-        return skeleton()
-    text_parts: list[str] = []
-    candidates = payload.get("candidates")
-    if isinstance(candidates, list):
-        for candidate in candidates:
-            if not isinstance(candidate, dict):
-                continue
-            content = candidate.get("content")
-            if not isinstance(content, dict):
-                continue
-            parts = content.get("parts")
-            if not isinstance(parts, list):
-                continue
-            for part in parts:
-                if isinstance(part, dict) and isinstance(part.get("text"), str):
-                    text_parts.append(part["text"])
-            if text_parts:
-                break
-    if not text_parts:
-        if isinstance(payload.get("fields"), dict):
-            return fields_from_gemini(payload)
-        return skeleton()
-    raw_text = "\n".join(text_parts).strip()
-    if raw_text.startswith("```"):
-        raw_text = raw_text.split("\n", 1)[-1]
-        if raw_text.endswith("```"):
-            raw_text = raw_text[: raw_text.rfind("```")]
-        raw_text = raw_text.strip()
-    try:
-        decoded = json.loads(raw_text)
-    except json.JSONDecodeError:
-        return skeleton()
-    return fields_from_gemini(decoded)
+def blank_record(failure_reason: str | None) -> dict[str, Any]:
+    if isinstance(failure_reason, str):
+        failure_reason = redact_secret(failure_reason)
+    return {
+        "usable": False,
+        "failure_reason": failure_reason,
+        "fields": skeleton_fields(),
+    }
 
 
-def build_gemini_request(page_pngs: list[bytes]) -> dict[str, Any]:
-    """Build the generateContent request. Does not send it.
+def iter_leaves(obj: Any, path: str = ""):
+    if isinstance(obj, dict) and obj.get("status") in {"found", "not_found", "conflict"}:
+        yield path, obj
+        return
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            child = f"{path}.{key}" if path else str(key)
+            yield from iter_leaves(value, child)
 
-    The key is read from the environment at call time, never from a file.
-    """
-    key = os.environ["GEMINI_API_KEY"]
-    parts: list[dict[str, Any]] = [{"text": GEMINI_PROMPT}]
-    for png in page_pngs:
-        parts.append(
+
+def parse_page(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value >= 1 else None
+    if isinstance(value, float) and value.is_integer():
+        number = int(value)
+        return number if number >= 1 else None
+    if isinstance(value, str) and value.strip().isdigit():
+        number = int(value.strip())
+        return number if number >= 1 else None
+    return None
+
+
+def quote_ok(excerpt: Any, page: Any, pages_read: set[int] | None) -> int | None:
+    if not isinstance(excerpt, str) or excerpt.strip() == "":
+        return None
+    number = parse_page(page)
+    if number is None:
+        return None
+    if pages_read is not None and number not in pages_read:
+        return None
+    return number
+
+
+def value_obj(printed: str, normalized: Any) -> dict[str, Any]:
+    return {"printed": printed, "normalized": normalized}
+
+
+def same_value(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    return left.get("printed") == right.get("printed") and left.get("normalized") == right.get("normalized")
+
+
+def write_found(slot: dict[str, Any], printed: str, normalized: Any, page: int, excerpt: str) -> None:
+    side_value = value_obj(printed, normalized)
+    side = {"value": side_value, "page": page, "excerpt": excerpt}
+    status = slot.get("status")
+    if status == "not_found":
+        slot.clear()
+        slot.update(
             {
-                "inline_data": {
-                    "mime_type": "image/png",
-                    "data": base64.b64encode(png).decode("ascii"),
-                }
+                "status": "found",
+                "value": side_value,
+                "page": page,
+                "excerpt": excerpt,
             }
         )
-    return {
-        "url": GEMINI_URL,
-        "headers": {
-            "Content-Type": "application/json",
-            "x-goog-api-key": key,
-        },
-        "body": {
-            "contents": [{"role": "user", "parts": parts}],
-            "generationConfig": {"responseMimeType": "application/json"},
-        },
+        return
+    if status == "found":
+        if same_value(slot["value"], side_value):
+            return
+        previous = {
+            "value": slot["value"],
+            "page": slot["page"],
+            "excerpt": slot["excerpt"],
+        }
+        slot.clear()
+        slot.update({"status": "conflict", "sides": [previous, side]})
+        return
+    if status == "conflict":
+        if any(same_value(item["value"], side_value) for item in slot["sides"]):
+            return
+        slot["sides"].append(side)
+
+
+def as_number(text: str) -> int | float:
+    if "." in text:
+        number = float(text)
+        if number.is_integer():
+            return int(number)
+        return number
+    return int(text)
+
+
+def whole(number: int | float) -> int | float:
+    if isinstance(number, float) and number.is_integer():
+        return int(number)
+    return number
+
+
+def find_dollars(excerpt: str) -> list[dict[str, Any]]:
+    found = []
+    for match in DOLLAR_RE.finditer(excerpt):
+        raw_number = match.group(1).replace(",", "")
+        cents = match.group(2)
+        if cents and cents != "00":
+            number: int | float = float(f"{raw_number}.{cents}")
+        else:
+            number = int(raw_number)
+        found.append(
+            {
+                "raw": match.group(0).replace(" ", ""),
+                "value": number,
+                "start": match.start(),
+                "end": match.end(),
+            }
+        )
+    return found
+
+
+def find_percents(excerpt: str) -> list[dict[str, Any]]:
+    spans: list[tuple[int, int]] = []
+    found: list[dict[str, Any]] = []
+    for match in SLASH_RE.finditer(excerpt):
+        spans.append((match.start(), match.end()))
+        groups = [match.group(i) for i in range(1, 5) if match.group(i) is not None]
+        # A fourth slash number is not part of the triple. Keep it so the
+        # caller can ignore anything past the first three, but do not add
+        # further slash groups.
+        cursor = match.start()
+        for piece in groups:
+            at = excerpt.find(piece, cursor, match.end())
+            number = as_number(piece)
+            if 0 <= number <= 100:
+                found.append(
+                    {
+                        "raw": piece,
+                        "value": number,
+                        "start": at,
+                        "end": at + len(piece),
+                        "slash": True,
+                    }
+                )
+            cursor = at + len(piece)
+    for match in PCT_RE.finditer(excerpt):
+        if any(start <= match.start() < end for start, end in spans):
+            continue
+        number = as_number(match.group(1))
+        if 0 <= number <= 100:
+            found.append(
+                {
+                    "raw": match.group(0).strip(),
+                    "value": number,
+                    "start": match.start(),
+                    "end": match.end(),
+                    "slash": False,
+                }
+            )
+    found.sort(key=lambda item: item["start"])
+    return found
+
+
+def find_categories(excerpt: str) -> list[dict[str, Any]]:
+    found: list[dict[str, Any]] = []
+    for name, pattern in CLASS_PATTERNS:
+        for match in pattern.finditer(excerpt):
+            found.append({"name": name, "start": match.start(), "end": match.end(), "raw": match.group(0)})
+    found.sort(key=lambda item: (item["start"], -(item["end"] - item["start"])))
+    kept: list[dict[str, Any]] = []
+    cursor = -1
+    for item in found:
+        if item["start"] < cursor:
+            continue
+        kept.append(item)
+        cursor = item["end"]
+    return kept
+
+
+def network_matches(excerpt: str) -> list[tuple[int, int, str]]:
+    found: list[tuple[int, int, str]] = []
+    for match in IN_RE.finditer(excerpt):
+        found.append((match.start(), match.end(), "in_network"))
+    for match in OUT_RE.finditer(excerpt):
+        found.append((match.start(), match.end(), "out_of_network"))
+    found.sort()
+    return found
+
+
+def shared_network_phrase(excerpt: str, matches: list[tuple[int, int, str]]) -> bool:
+    kinds = {kind for _, _, kind in matches}
+    if kinds != {"in_network", "out_of_network"}:
+        return False
+    if len(matches) < 2:
+        return False
+    first_end = matches[0][1]
+    second_start = matches[1][0]
+    if second_start - first_end > 60:
+        return False
+    between = excerpt[first_end:second_start]
+    return re.search(r"\d", between) is None
+
+
+def networks_for(excerpt: str, value_count: int, pos: int) -> list[str]:
+    matches = network_matches(excerpt)
+    kinds = {kind for _, _, kind in matches}
+    if "in_network" in kinds and "out_of_network" in kinds:
+        if value_count == 1 or shared_network_phrase(excerpt, matches):
+            return ["in_network", "out_of_network"]
+        nearest = min(matches, key=lambda item: abs(pos - item[0]))
+        return [nearest[2]]
+    if "in_network" in kinds:
+        return ["in_network"]
+    if "out_of_network" in kinds:
+        return ["out_of_network"]
+    return ["unlabeled"]
+
+
+def put_network(
+    group: dict[str, Any],
+    excerpt: str,
+    pos: int,
+    value_count: int,
+    printed: str,
+    normalized: Any,
+    page: int,
+) -> None:
+    for name in networks_for(excerpt, value_count, pos):
+        write_found(group[name], printed, normalized, page, excerpt)
+
+
+def percent_role(excerpt: str, start: int, end: int) -> str:
+    window = excerpt[max(0, start - 60) : end]
+    if MEMBER_PHRASE_RE.search(window) or re.search(r"(?i)\b(?:you|member|patient)\s+pays?\b", window):
+        return "member"
+    if PLAN_PHRASE_RE.search(window) or re.search(r"(?i)\b(?:plan|insurance|we)\s+pays?\b", window):
+        return "plan"
+    return "bare"
+
+
+def member_phrase(excerpt: str) -> str | None:
+    match = MEMBER_PHRASE_RE.search(excerpt)
+    if match:
+        return match.group(0)
+    return None
+
+
+def plan_phrase(excerpt: str) -> str | None:
+    match = PLAN_PHRASE_RE.search(excerpt)
+    if match:
+        return match.group(0)
+    return None
+
+
+def apply_percent_decision(
+    group: dict[str, Any],
+    excerpt: str,
+    percents: list[dict[str, Any]],
+    page: int,
+    value_count: int,
+) -> None:
+    if not percents:
+        return
+    members = [item for item in percents if percent_role(excerpt, item["start"], item["end"]) == "member"]
+    plans = [item for item in percents if percent_role(excerpt, item["start"], item["end"]) != "member"]
+    member_values = {item["value"] for item in members}
+    plan_values = {item["value"] for item in plans}
+    pos = percents[0]["start"]
+    if len(member_values) > 1 or len(plan_values) > 1:
+        for item in percents:
+            write_found(
+                group[networks_for(excerpt, value_count, item["start"])[0]],
+                item["raw"],
+                item["value"],
+                page,
+                excerpt,
+            )
+        return
+    if members and plans:
+        member_n = members[0]["value"]
+        plan_n = plans[0]["value"]
+        plan_printed = plan_phrase(excerpt) or plans[0]["raw"]
+        member_printed = member_phrase(excerpt) or members[0]["raw"]
+        if abs((plan_n + member_n) - 100) < 0.001:
+            put_network(group, excerpt, pos, value_count, plan_printed, whole(plan_n), page)
+            return
+        # Keep both stated sides. Do not pick one and do not convert.
+        put_network(group, excerpt, pos, value_count, plan_printed, whole(plan_n), page)
+        put_network(group, excerpt, members[0]["start"], value_count, member_printed, whole(member_n), page)
+        return
+    if members:
+        member_n = members[0]["value"]
+        printed = member_phrase(excerpt) or members[0]["raw"]
+        put_network(group, excerpt, pos, value_count, printed, whole(100 - member_n), page)
+        return
+    item = plans[0]
+    printed = plan_phrase(excerpt) or item["raw"]
+    put_network(group, excerpt, item["start"], value_count, printed, whole(item["value"]), page)
+
+
+def apply_dollars(
+    group: dict[str, Any],
+    excerpt: str,
+    dollars: list[dict[str, Any]],
+    page: int,
+    value_count: int,
+) -> None:
+    for item in dollars:
+        put_network(group, excerpt, item["start"], value_count, item["raw"], item["value"], page)
+
+
+def class_percent_from_results(
+    results: dict[str, dict[str, Any]],
+    class_name: str,
+) -> dict[str, Any] | None:
+    found = results.get(class_name)
+    if not found:
+        return None
+    if found.get("kind") == "percent":
+        return found
+    return None
+
+
+def parse_classes(fields: dict[str, Any], excerpt: str, page: int) -> None:
+    categories = find_categories(excerpt)
+    percents = find_percents(excerpt)
+    dollars = find_dollars(excerpt)
+    if categories:
+        parse_labeled(fields, excerpt, page, categories, percents, dollars)
+        return
+    if len(percents) >= 3:
+        parse_unlabeled_triple(fields, excerpt, page, percents)
+    # One or two percents with no class label are not a triple and stay not_found.
+
+
+def parse_unlabeled_triple(
+    fields: dict[str, Any],
+    excerpt: str,
+    page: int,
+    percents: list[dict[str, Any]],
+) -> None:
+    matches = network_matches(excerpt)
+    kinds = {kind for _, _, kind in matches}
+    if kinds == {"in_network", "out_of_network"} and len(percents) >= 6 and not shared_network_phrase(excerpt, matches):
+        grouped: dict[str, list[dict[str, Any]]] = {"in_network": [], "out_of_network": []}
+        for item in percents:
+            network = networks_for(excerpt, len(percents), item["start"])[0]
+            if network in grouped:
+                grouped[network].append(item)
+        for network, items in grouped.items():
+            for category, item in zip(("preventive", "basic", "major"), items[:3]):
+                write_found(fields[category][network], item["raw"], item["value"], page, excerpt)
+        return
+    first_three = percents[:3]
+    if kinds == {"in_network", "out_of_network"}:
+        targets = ["in_network", "out_of_network"]
+    elif "in_network" in kinds:
+        targets = ["in_network"]
+    elif "out_of_network" in kinds:
+        targets = ["out_of_network"]
+    else:
+        targets = ["unlabeled"]
+    for category, item in zip(("preventive", "basic", "major"), first_three):
+        for network in targets:
+            write_found(fields[category][network], item["raw"], item["value"], page, excerpt)
+
+
+def parse_labeled(
+    fields: dict[str, Any],
+    excerpt: str,
+    page: int,
+    categories: list[dict[str, Any]],
+    percents: list[dict[str, Any]],
+    dollars: list[dict[str, Any]],
+) -> None:
+    value_count = max(len(percents), len(dollars), 1)
+    local: list[tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]] = []
+    for index, category in enumerate(categories):
+        right = categories[index + 1]["start"] if index + 1 < len(categories) else len(excerpt)
+        own_percents = [item for item in percents if category["end"] <= item["start"] < right]
+        own_dollars = [item for item in dollars if category["end"] <= item["start"] < right]
+        if not own_percents and not own_dollars:
+            left = categories[index - 1]["end"] if index else 0
+            own_percents = [item for item in percents if left <= item["start"] < category["start"]]
+            own_dollars = [item for item in dollars if left <= item["start"] < category["start"]]
+        local.append((category, own_percents, own_dollars))
+
+    direct: dict[str, dict[str, Any]] = {}
+    any_local = any(own_percents or own_dollars for _, own_percents, own_dollars in local)
+    if not any_local and percents:
+        for category, item in zip(categories, percents[: len(categories)]):
+            apply_percent_decision(fields[category["name"]], excerpt, [item], page, len(percents))
+            direct[category["name"]] = {
+                "kind": "percent",
+                "value": item["value"],
+                "printed": item["raw"],
+                "pos": item["start"],
+            }
+    else:
+        for category, own_percents, own_dollars in local:
+            name = category["name"]
+            if own_percents and own_dollars:
+                apply_percent_decision(fields[name], excerpt, own_percents, page, value_count)
+                apply_dollars(fields[name], excerpt, own_dollars, page, value_count)
+                direct[name] = {
+                    "kind": "percent",
+                    "value": own_percents[0]["value"],
+                    "printed": own_percents[0]["raw"],
+                    "pos": own_percents[0]["start"],
+                }
+                continue
+            if own_percents:
+                apply_percent_decision(fields[name], excerpt, own_percents, page, value_count)
+                direct[name] = {
+                    "kind": "percent",
+                    "value": own_percents[0]["value"],
+                    "printed": own_percents[0]["raw"],
+                    "pos": own_percents[0]["start"],
+                }
+                continue
+            if own_dollars:
+                apply_dollars(fields[name], excerpt, own_dollars, page, value_count)
+                direct[name] = {"kind": "copay", "value": own_dollars[0]["value"], "pos": own_dollars[0]["start"]}
+
+    assign = ASSIGN_RE.search(excerpt)
+    if not assign:
+        return
+    class_name = next(group for group in assign.groups() if group)
+    class_name = class_name.lower()
+    parent = class_percent_from_results(direct, class_name)
+    if parent is None:
+        return
+    # The class percent token itself must sit in this excerpt.
+    if str(parent["value"]) not in excerpt and parent["printed"] not in excerpt:
+        return
+    for category in categories:
+        name = category["name"]
+        if name not in ASSIGNABLE:
+            continue
+        if name in direct:
+            continue
+        if category["raw"].lower() not in excerpt.lower():
+            continue
+        printed = parent["printed"] if "%" in parent["printed"] else f"{parent['value']}%"
+        # Prefer the printed class percent token when it includes a percent sign.
+        if "%" not in printed:
+            printed = f"{whole(parent['value'])}%"
+        put_network(
+            fields[name],
+            excerpt,
+            parent["pos"],
+            value_count,
+            printed if printed in excerpt or parent["printed"] in excerpt else parent["printed"],
+            whole(parent["value"]),
+            page,
+        )
+
+
+def deductible_bucket(excerpt: str, pos: int) -> str:
+    window = excerpt[max(0, pos - 80) : pos + 40]
+    family = FAMILY_RE.search(window) is not None
+    person = PERSON_RE.search(window) is not None
+    if person and not family:
+        return "deductible_individual"
+    if family and not person:
+        return "deductible_family"
+    return "deductible_unlabeled"
+
+
+def apply_waiting(fields: dict[str, Any], excerpt: str, page: int) -> bool:
+    if not re.search(r"(?i)\bwaiting\b", excerpt):
+        return False
+    named = []
+    if ORTHO_RE.search(excerpt):
+        named.append("ortho")
+    if re.search(r"(?i)\bmajor\b", excerpt):
+        named.append("major")
+    if re.search(r"(?i)\bbasic\b", excerpt):
+        named.append("basic")
+    # Preventive waiting is not a field. Do not copy one class onto another.
+    if len(named) != 1:
+        return True
+    target = fields["waiting_period"][named[0]]
+    if WAITING_NONE_RE.search(excerpt):
+        write_found(target, "none", None, page, excerpt)
+        return True
+    months = MONTH_RE.search(excerpt)
+    if months:
+        write_found(target, months.group(0), int(months.group(1)), page, excerpt)
+        return True
+    years = YEAR_RE.search(excerpt)
+    if years:
+        write_found(target, years.group(0), None, page, excerpt)
+        return True
+    write_found(target, re.sub(r"\s+", " ", excerpt).strip(), None, page, excerpt)
+    return True
+
+
+def apply_waiver(fields: dict[str, Any], excerpt: str, page: int) -> bool:
+    if DEDUCTIBLE_RE.search(excerpt) is None:
+        return False
+    waived = WAIVED_RE.search(excerpt) is not None
+    applies = APPLIES_RE.search(excerpt) is not None
+    if not waived and not applies:
+        return False
+    if PREVENTIVE_WORD_RE.search(excerpt) is None:
+        return False
+    other = re.search(r"(?i)\b(?:orthodont|basic|major|endodont|periodont|oral\s+surgery)\b", excerpt)
+    preventive = PREVENTIVE_WORD_RE.search(excerpt)
+    if other and preventive is None:
+        return False
+    slot = fields["preventive_deductible_waived"]
+    if waived and applies:
+        write_found(slot, "waived", None, page, excerpt)
+        write_found(slot, "applies", None, page, excerpt)
+    elif waived:
+        write_found(slot, "waived", None, page, excerpt)
+    else:
+        write_found(slot, "applies", None, page, excerpt)
+    return find_dollars(excerpt) == []
+
+
+def apply_deductible(fields: dict[str, Any], excerpt: str, page: int) -> bool:
+    if DEDUCTIBLE_RE.search(excerpt) is None:
+        return False
+    dollars = find_dollars(excerpt)
+    if not dollars:
+        return False
+    for item in dollars:
+        bucket = deductible_bucket(excerpt, item["start"])
+        put_network(
+            fields[bucket],
+            excerpt,
+            item["start"],
+            len(dollars),
+            item["raw"],
+            item["value"],
+            page,
+        )
+    return True
+
+
+def family_only_maximum(excerpt: str) -> bool:
+    return FAMILY_RE.search(excerpt) is not None and PERSON_RE.search(excerpt) is None
+
+
+def per_person_dollars(excerpt: str, dollars: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if FAMILY_RE.search(excerpt) is None or PERSON_RE.search(excerpt) is None or len(dollars) < 2:
+        return dollars
+    person = PERSON_RE.search(excerpt)
+    if not person:
+        return dollars
+    chosen = min(dollars, key=lambda item: abs(item["start"] - person.start()))
+    return [chosen]
+
+
+def apply_maximum(fields: dict[str, Any], excerpt: str, page: int) -> bool:
+    if MAXIMUM_RE.search(excerpt) is None and not (ORTHO_RE.search(excerpt) and LIFETIME_RE.search(excerpt)):
+        return False
+    lifetime = LIFETIME_RE.search(excerpt) is not None
+    annual = ANNUAL_RE.search(excerpt) is not None
+    ortho = ORTHO_RE.search(excerpt) is not None
+    dollars = find_dollars(excerpt)
+    if lifetime and ortho and dollars:
+        for item in dollars:
+            write_found(fields["ortho_lifetime_max"], item["raw"], item["value"], page, excerpt)
+        return True
+    if lifetime and not ortho:
+        # Lifetime dollars that are not orthodontia fill neither annual nor ortho.
+        return True
+    if not annual and not lifetime:
+        # A maximum with neither annual nor lifetime stays not_found.
+        return True
+    if not annual:
+        return True
+    if family_only_maximum(excerpt):
+        # A family annual maximum is not the per-person annual maximum.
+        return True
+    chosen = per_person_dollars(excerpt, dollars)
+    for item in chosen:
+        put_network(
+            fields["annual_maximum"],
+            excerpt,
+            item["start"],
+            len(chosen),
+            item["raw"],
+            item["value"],
+            page,
+        )
+    return True
+
+
+def apply_ortho_copay(fields: dict[str, Any], excerpt: str, page: int) -> bool:
+    if ORTHO_RE.search(excerpt) is None:
+        return False
+    if LIFETIME_RE.search(excerpt):
+        return False
+    if re.search(r"(?i)\bcopay\b|\bpatient\s+cost\b", excerpt) is None:
+        return False
+    dollars = find_dollars(excerpt)
+    percents = find_percents(excerpt)
+    if not dollars and not percents:
+        return False
+    for item in dollars:
+        write_found(fields["ortho_coinsurance_or_copay"], item["raw"], item["value"], page, excerpt)
+    for item in percents:
+        if re.search(r"(?i)\bcoinsurance\b|\bcopay\b|\bpatient\s+cost\b", excerpt):
+            write_found(fields["ortho_coinsurance_or_copay"], item["raw"], item["value"], page, excerpt)
+    return True
+
+
+def apply_ortho_age(fields: dict[str, Any], excerpt: str, page: int) -> bool:
+    if ORTHO_RE.search(excerpt) is None:
+        return False
+    if re.search(r"(?i)\bwaiting\b|\bdeductible\b|\bcopay\b", excerpt):
+        return False
+    no_age = NO_AGE_RE.search(excerpt)
+    if no_age:
+        write_found(fields["ortho_age_limit"], no_age.group(0), None, page, excerpt)
+        return True
+    age = AGE_RE.search(excerpt)
+    if not age:
+        # "Child" or "children" with no age is not_found.
+        return True
+    number = next(group for group in age.groups() if group)
+    write_found(fields["ortho_age_limit"], age.group(0), int(number), page, excerpt)
+    return True
+
+
+def apply_basis(fields: dict[str, Any], excerpt: str, page: int) -> bool:
+    if BASIS_RE.search(excerpt) is None:
+        return False
+    if find_categories(excerpt) and find_percents(excerpt):
+        return False
+    printed = re.sub(r"\s+", " ", excerpt).strip()
+    write_found(fields["out_of_network_basis"], printed, None, page, excerpt)
+    return True
+
+
+def apply_excerpt(fields: dict[str, Any], excerpt: str, page: int) -> None:
+    if len(PROCEDURE_RE.findall(excerpt)) >= 2:
+        return
+    if apply_waiting(fields, excerpt, page):
+        return
+    waiver_done = apply_waiver(fields, excerpt, page)
+    if waiver_done:
+        return
+    if apply_deductible(fields, excerpt, page):
+        return
+    if apply_maximum(fields, excerpt, page):
+        return
+    if apply_ortho_copay(fields, excerpt, page):
+        return
+    if apply_ortho_age(fields, excerpt, page):
+        return
+    if find_categories(excerpt) or len(find_percents(excerpt)) >= 3:
+        parse_classes(fields, excerpt, page)
+        return
+    apply_basis(fields, excerpt, page)
+
+
+def clean_label(excerpt: str, label: re.Pattern[str]) -> str:
+    text = re.sub(r"\s+", " ", excerpt).strip()
+    match = label.match(text)
+    if match:
+        return text[match.end() :].strip(" :-")
+    return text
+
+
+def apply_carrier(fields: dict[str, Any], raw: Any, pages_read: set[int] | None) -> None:
+    for item in as_quote_list(raw):
+        excerpt, page = pull_quote(item)
+        number = quote_ok(excerpt, page, pages_read)
+        if number is None or excerpt is None:
+            continue
+        printed = clean_label(excerpt, re.compile(r"(?i)^(?:carrier|insurer|insurance company|underwritten by)\s*[:\-]\s*"))
+        write_found(fields["carrier"], printed, None, number, excerpt)
+
+
+def apply_plan_name(fields: dict[str, Any], raw: Any, pages_read: set[int] | None) -> None:
+    for item in as_quote_list(raw):
+        excerpt, page = pull_quote(item)
+        number = quote_ok(excerpt, page, pages_read)
+        if number is None or excerpt is None:
+            continue
+        printed = clean_label(excerpt, re.compile(r"(?i)^plan\s+name\s*[:\-]\s*"))
+        write_found(fields["plan_name"], printed, None, number, excerpt)
+
+
+def apply_plan_type(fields: dict[str, Any], raw: Any, pages_read: set[int] | None) -> None:
+    for item in as_quote_list(raw):
+        excerpt, page = pull_quote(item)
+        number = quote_ok(excerpt, page, pages_read)
+        if number is None or excerpt is None:
+            continue
+        seen: list[tuple[str, str]] = []
+        for match in PLAN_TYPE_RE.finditer(excerpt):
+            token = match.group(0)
+            key = token.upper()
+            if key == "FEE-FOR-SERVICE":
+                key = "FFS"
+            if any(existing == key for existing, _ in seen):
+                continue
+            seen.append((key, token))
+        if len(seen) == 1:
+            write_found(fields["plan_type"], seen[0][1], None, number, excerpt)
+        elif len(seen) > 1:
+            for _, token in seen:
+                write_found(fields["plan_type"], token, None, number, excerpt)
+
+
+def pull_quote(item: Any) -> tuple[str | None, Any]:
+    if isinstance(item, str):
+        return item, None
+    if not isinstance(item, dict):
+        return None, None
+    excerpt = item.get("excerpt")
+    if not isinstance(excerpt, str):
+        excerpt = item.get("quote")
+    if not isinstance(excerpt, str):
+        excerpt = item.get("evidence")
+    page = item.get("page", item.get("page_number"))
+    return excerpt if isinstance(excerpt, str) else None, page
+
+
+def as_quote_list(raw: Any) -> list[Any]:
+    if raw is None:
+        return []
+    if isinstance(raw, list):
+        return raw
+    if isinstance(raw, dict):
+        if any(key in raw for key in ("excerpt", "quote", "evidence")):
+            return [raw]
+        return []
+    if isinstance(raw, str):
+        return [raw]
+    return []
+
+
+def collect_excerpts(plan: dict[str, Any]) -> list[Any]:
+    lines: list[Any] = []
+    for key in ("excerpts", "lines", "statements", "quotes"):
+        value = plan.get(key)
+        if isinstance(value, list):
+            lines.extend(value)
+        elif isinstance(value, dict):
+            lines.append(value)
+        elif isinstance(value, str):
+            lines.append(value)
+    skip = {
+        "carrier",
+        "plan_name",
+        "plan_type",
+        "excerpts",
+        "lines",
+        "statements",
+        "quotes",
+        "usable",
+        "failure_reason",
     }
+    for key, value in plan.items():
+        if key in skip:
+            continue
+        walk_quotes(value, lines)
+    return lines
+
+
+def walk_quotes(value: Any, lines: list[Any]) -> None:
+    if isinstance(value, dict):
+        if any(isinstance(value.get(key), str) for key in ("excerpt", "quote", "evidence")):
+            lines.append(value)
+        for child in value.values():
+            walk_quotes(child, lines)
+        return
+    if isinstance(value, list):
+        for child in value:
+            walk_quotes(child, lines)
+
+
+def compute_usable(fields: dict[str, Any]) -> bool:
+    def net_ok(group: dict[str, Any]) -> bool:
+        slots = (group["in_network"], group["out_of_network"], group["unlabeled"])
+        if any(slot.get("status") == "conflict" for slot in slots):
+            return False
+        return any(slot.get("status") == "found" for slot in slots)
+
+    if fields["carrier"].get("status") != "found":
+        return False
+    if not net_ok(fields["annual_maximum"]):
+        return False
+    for name in ("preventive", "basic", "major"):
+        if not net_ok(fields[name]):
+            return False
+    return True
+
+
+def restrict_pages(fields: dict[str, Any], pages_read: set[int] | None) -> None:
+    if pages_read is None:
+        return
+
+    def fix(slot: dict[str, Any]) -> None:
+        status = slot.get("status")
+        if status == "found":
+            if quote_ok(slot.get("excerpt"), slot.get("page"), pages_read) is None:
+                slot.clear()
+                slot.update(not_found())
+            return
+        if status != "conflict":
+            return
+        kept = []
+        for side in slot.get("sides", []):
+            if quote_ok(side.get("excerpt"), side.get("page"), pages_read) is not None:
+                kept.append(side)
+        slot.clear()
+        if len(kept) >= 2:
+            slot.update({"status": "conflict", "sides": kept})
+        elif len(kept) == 1:
+            side = kept[0]
+            slot.update(
+                {
+                    "status": "found",
+                    "value": side["value"],
+                    "page": side["page"],
+                    "excerpt": side["excerpt"],
+                }
+            )
+        else:
+            slot.update(not_found())
+
+    for _, slot in list(iter_leaves(fields)):
+        fix(slot)
+
+
+def coerce_plan(plan: Any, pages_read: set[int] | None) -> dict[str, Any]:
+    fields = skeleton_fields()
+    if not isinstance(plan, dict):
+        return {"usable": False, "failure_reason": None, "fields": fields}
+    if isinstance(plan.get("fields"), dict) and "carrier" not in plan and "excerpts" not in plan:
+        merged = dict(plan["fields"])
+        for key, value in plan.items():
+            if key != "fields":
+                merged[key] = value
+        plan = merged
+    apply_carrier(fields, plan.get("carrier"), pages_read)
+    apply_plan_name(fields, plan.get("plan_name"), pages_read)
+    apply_plan_type(fields, plan.get("plan_type"), pages_read)
+    seen: set[tuple[str, int]] = set()
+    for item in collect_excerpts(plan):
+        excerpt, page = pull_quote(item)
+        number = quote_ok(excerpt, page, pages_read)
+        if number is None or excerpt is None:
+            continue
+        key = (excerpt, number)
+        if key in seen:
+            continue
+        seen.add(key)
+        lines = [part.strip() for part in excerpt.splitlines() if part.strip()]
+        if not lines:
+            continue
+        for line in lines:
+            apply_excerpt(fields, line, number)
+    restrict_pages(fields, pages_read)
+    return {
+        "usable": compute_usable(fields),
+        "failure_reason": None,
+        "fields": fields,
+    }
+
+
+def plan_list(payload: Any) -> list[Any] | None:
+    if isinstance(payload, list):
+        return payload
+    if not isinstance(payload, dict):
+        return None
+    plans = payload.get("plans")
+    if isinstance(plans, list):
+        return plans
+    if isinstance(payload.get("fields"), dict) or any(
+        key in payload for key in ("carrier", "excerpts", "plan_name", "plan_type")
+    ):
+        return [payload]
+    records = payload.get("records")
+    if isinstance(records, list):
+        return records
+    return []
+
+
+def coerce_model_json(payload: Any, pages_read: set[int] | None = None) -> list[dict[str, Any]]:
+    """Coerce model JSON into benefit records. Rules read excerpts, not pixels."""
+    plans = plan_list(payload)
+    if plans is None:
+        return [blank_record("model JSON was not an object")]
+    if not plans:
+        return [blank_record(None)]
+    return [coerce_plan(plan, pages_read) for plan in plans]
 
 
 def redact_secret(message: str) -> str:
@@ -1024,47 +1065,6 @@ def redact_secret(message: str) -> str:
     if secret:
         return message.replace(secret, "[redacted]")
     return message
-
-
-def execute_gemini_request(request: dict[str, Any]) -> tuple[Any, str | None]:
-    """POST the prepared generateContent request. The key stays in the header."""
-    import urllib.error
-    import urllib.request
-
-    data = json.dumps(request["body"]).encode("utf-8")
-    outgoing = urllib.request.Request(
-        request["url"],
-        data=data,
-        headers=dict(request["headers"]),
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(outgoing, timeout=180) as response:
-            raw = response.read().decode("utf-8", errors="replace")
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")
-        return None, redact_secret(f"gemini http {exc.code}: {detail}")
-    except urllib.error.URLError as exc:
-        return None, redact_secret(f"gemini request failed: {exc}")
-    except TimeoutError as exc:
-        return None, redact_secret(f"gemini request failed: {exc}")
-    try:
-        return json.loads(raw), None
-    except json.JSONDecodeError:
-        return None, "gemini response was not JSON"
-
-
-def prepare_gemini_request(page_pngs: list[bytes]) -> dict[str, Any]:
-    """Return the request, or an error if the key is missing.
-
-    A missing key does not fall through to a call.
-    """
-    try:
-        if os.environ["GEMINI_API_KEY"] == "":
-            return {"ok": False, "error": "GEMINI_API_KEY is not set"}
-    except KeyError:
-        return {"ok": False, "error": "GEMINI_API_KEY is not set"}
-    return {"ok": True, "request": build_gemini_request(page_pngs)}
 
 
 def render_pdf_pages(path: str) -> tuple[list[bytes] | None, str | None]:
@@ -1098,89 +1098,194 @@ def render_pdf_pages(path: str) -> tuple[list[bytes] | None, str | None]:
         return images, None
 
 
+def build_gemini_request(page_pngs: list[bytes]) -> dict[str, Any]:
+    """Build the generateContent request. The key is read here, from the environment."""
+    key = os.environ["GEMINI_API_KEY"]
+    parts: list[dict[str, Any]] = [{"text": GEMINI_PROMPT}]
+    for index, png in enumerate(page_pngs, start=1):
+        parts.append({"text": f"Page {index} image follows."})
+        parts.append(
+            {
+                "inline_data": {
+                    "mime_type": "image/png",
+                    "data": base64.b64encode(png).decode("ascii"),
+                }
+            }
+        )
+    return {
+        "url": GEMINI_URL,
+        "headers": {
+            "Content-Type": "application/json",
+            "x-goog-api-key": key,
+        },
+        "body": {
+            "contents": [{"role": "user", "parts": parts}],
+            "generationConfig": {"responseMimeType": "application/json"},
+        },
+    }
+
+
+def prepare_gemini_request(page_pngs: list[bytes]) -> dict[str, Any]:
+    if not CALLS_ENABLED:
+        return {"ok": False, "error": "CALLS_ENABLED is false"}
+    try:
+        if os.environ["GEMINI_API_KEY"] == "":
+            return {"ok": False, "error": "GEMINI_API_KEY is not set"}
+    except KeyError:
+        return {"ok": False, "error": "GEMINI_API_KEY is not set"}
+    return {"ok": True, "request": build_gemini_request(page_pngs)}
+
+
+def execute_gemini_request(request: dict[str, Any]) -> tuple[Any, str | None]:
+    data = json.dumps(request["body"]).encode("utf-8")
+    outgoing = urllib.request.Request(
+        request["url"],
+        data=data,
+        headers=dict(request["headers"]),
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(outgoing, timeout=180) as response:
+            raw = response.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        return None, redact_secret(f"gemini http {exc.code}: {detail}")
+    except urllib.error.URLError as exc:
+        return None, redact_secret(f"gemini request failed: {exc.reason}")
+    except TimeoutError as exc:
+        return None, redact_secret(f"gemini request failed: {exc}")
+    try:
+        return json.loads(raw), None
+    except json.JSONDecodeError:
+        return None, "gemini response was not JSON"
+
+
+def model_text_from_response(payload: Any) -> str | None:
+    if not isinstance(payload, dict):
+        return None
+    candidates = payload.get("candidates")
+    if not isinstance(candidates, list):
+        return None
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        content = candidate.get("content")
+        if not isinstance(content, dict):
+            continue
+        parts = content.get("parts")
+        if not isinstance(parts, list):
+            continue
+        texts = [part.get("text") for part in parts if isinstance(part, dict) and isinstance(part.get("text"), str)]
+        if texts:
+            return "\n".join(texts)
+    return None
+
+
+def decode_model_json(payload: Any) -> tuple[Any, str | None]:
+    if isinstance(payload, dict) and (
+        "plans" in payload or "fields" in payload or "carrier" in payload or "records" in payload
+    ):
+        return payload, None
+    text = model_text_from_response(payload)
+    if text is None:
+        if isinstance(payload, dict):
+            return payload, None
+        return None, "gemini response had no JSON"
+    raw = text.strip()
+    if raw.startswith("```"):
+        raw = re.sub(r"^```(?:json)?\s*", "", raw)
+        raw = re.sub(r"\s*```$", "", raw)
+    try:
+        return json.loads(raw), None
+    except json.JSONDecodeError:
+        return None, "gemini response was not JSON"
+
+
+def text_result(kind: str, name: str | None) -> dict[str, Any]:
+    return {
+        "ok": True,
+        "records": [blank_record(TEXT_ONLY_REASON)],
+        "source": {"kind": kind, "name": name},
+    }
+
+
+def failure_payload(message: str, source: dict[str, Any]) -> dict[str, Any]:
+    reason = redact_secret(message)
+    return {
+        "ok": False,
+        "error": reason,
+        "records": [blank_record(reason)],
+        "source": source,
+    }
+
 
 def emit(payload: dict[str, Any]) -> None:
     json.dump(payload, sys.stdout, indent=2, ensure_ascii=False)
     sys.stdout.write("\n")
 
 
-def error_payload(message: str, kind: str, name: str | None) -> dict[str, Any]:
-    return {"ok": False, "error": message, "source": {"kind": kind, "name": name}}
+def extract_text(text: str) -> dict[str, Any]:
+    """Text has no page image, so every leaf stays not_found."""
+    del text
+    return text_result("text", None)
 
 
-def read_text_file(path: str) -> str:
-    with open(path, encoding="utf-8", errors="replace") as handle:
-        return handle.read()
+def run_pdf(path: str) -> tuple[dict[str, Any], int]:
+    source: dict[str, Any] = {"kind": "pdf-images", "name": path, "provider": "gemini", "model": GEMINI_MODEL}
+    if not os.path.isfile(path):
+        return failure_payload(f"file not found: {path}", source), 1
+    images, err = render_pdf_pages(path)
+    if err or not images:
+        return failure_payload(err or "pdftoppm produced no page images", source), 1
+    pages_read = set(range(1, len(images) + 1))
+    source["page_count"] = len(images)
+    source["pages_read"] = list(range(1, len(images) + 1))
+    prepared = prepare_gemini_request(images)
+    if not prepared["ok"]:
+        return failure_payload(prepared["error"], source), 1
+    payload, call_err = execute_gemini_request(prepared["request"])
+    if call_err:
+        return failure_payload(call_err, source), 1
+    decoded, decode_err = decode_model_json(payload)
+    if decode_err or decoded is None:
+        return failure_payload(decode_err or "gemini response had no JSON", source), 1
+    records = coerce_model_json(decoded, pages_read)
+    return {"ok": True, "records": records, "source": source}, 0
 
 
 def run(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Extract dental benefit fields from a summary.")
-    parser.add_argument("file", nargs="?", help="PDF or text file. Use - or omit to read stdin.")
-    parser.add_argument("--text", dest="text_path", help="Read this path as text, not as a PDF.")
+    parser = argparse.ArgumentParser(description="Extract dental benefit fields from a summary PDF.")
+    parser.add_argument("file", nargs="?", help="PDF file. Use - or omit to read stdin as text.")
+    parser.add_argument("--text", dest="text_path", help="Read this path as text. Does not call Gemini.")
     args = parser.parse_args(argv)
-
     try:
         if args.text_path:
-            text = read_text_file(args.text_path)
-            result = extract_text(text)
-            result["source"] = {"kind": "text", "name": args.text_path}
-        elif not args.file or args.file == "-":
-            text = sys.stdin.read()
-            result = extract_text(text)
-            result["source"] = {"kind": "stdin", "name": None}
-        elif args.file.lower().endswith(".pdf"):
-            images, err = render_pdf_pages(args.file)
-            if err:
-                emit({"ok": False, "error": err})
+            if not os.path.isfile(args.text_path):
+                emit(failure_payload(f"file not found: {args.text_path}", {"kind": "text", "name": args.text_path}))
                 return 1
-            page_count = len(images or [])
-            if not CALLS_ENABLED:
-                emit(
-                    {
-                        "ok": False,
-                        "error": "vision model not confirmed",
-                        "source": {
-                            "kind": "pdf-images",
-                            "name": args.file,
-                            "page_count": page_count,
-                            "provider": "gemini",
-                        },
-                    }
-                )
-                return 2
-            prepared = prepare_gemini_request(images or [])
-            if not prepared["ok"]:
-                emit({"ok": False, "error": prepared["error"]})
-                return 1
-            payload, call_err = execute_gemini_request(prepared["request"])
-            if call_err:
-                emit({"ok": False, "error": call_err})
-                return 1
-            fields = parse_gemini_response(payload)
-            result = {
-                "ok": True,
-                "fields": fields,
-                "notes": collect_notes(fields),
-                "readable_summary": build_summary(fields),
-                "source": {
-                    "kind": "pdf-images",
-                    "name": args.file,
-                    "page_count": page_count,
-                    "provider": "gemini",
-                },
-            }
-        else:
-            text = read_text_file(args.file)
-            result = extract_text(text)
-            result["source"] = {"kind": "text", "name": args.file}
-    except FileNotFoundError as exc:
-        emit(error_payload(f"file not found: {exc.filename}", "file", str(exc.filename)))
-        return 1
+            with open(args.text_path, encoding="utf-8", errors="replace") as handle:
+                handle.read()
+            result = text_result("text", args.text_path)
+            emit(result)
+            return 0
+        if not args.file or args.file == "-":
+            sys.stdin.read()
+            emit(text_result("stdin", None))
+            return 0
+        if args.file.lower().endswith(".pdf"):
+            result, code = run_pdf(args.file)
+            emit(result)
+            return code
+        if not os.path.isfile(args.file):
+            emit(failure_payload(f"file not found: {args.file}", {"kind": "text", "name": args.file}))
+            return 1
+        with open(args.file, encoding="utf-8", errors="replace") as handle:
+            handle.read()
+        emit(text_result("text", args.file))
+        return 0
     except OSError as exc:
-        emit(error_payload(str(exc), "file", args.text_path or args.file))
+        emit(failure_payload(redact_secret(str(exc)), {"kind": "file", "name": args.text_path or args.file}))
         return 1
-    emit(result)
-    return 0
 
 
 def main() -> None:
