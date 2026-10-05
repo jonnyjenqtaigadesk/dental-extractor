@@ -676,5 +676,170 @@ class SourceAndCliTests(unittest.TestCase):
                 os.environ["GEMINI_API_KEY"] = previous
 
 
+
+class BrowserResponseTests(unittest.TestCase):
+    """The HTTP payload is images plus coercer records. These tests do not call Google."""
+
+    def setUp(self):
+        self._previous = os.environ.get("GEMINI_API_KEY")
+        os.environ["GEMINI_API_KEY"] = "unit-test-not-a-real-key"
+
+    def tearDown(self):
+        if self._previous is None:
+            os.environ.pop("GEMINI_API_KEY", None)
+        else:
+            os.environ["GEMINI_API_KEY"] = self._previous
+
+    def test_fake_success_response_has_records_and_images_without_secrets(self):
+        import serve
+
+        records = extract.coerce_model_json(
+            plan_payload(
+                [
+                    "Annual maximum: $1,500 per person",
+                    "Preventive 100% / Basic 80% / Major 50%",
+                ]
+            ),
+            {1},
+        )
+        dirty = json.loads(json.dumps(records))
+        dirty[0]["confidence"] = 0.91
+        dirty[0]["rates"] = {"employee": 12.5}
+        dirty[0]["raw_model_text"] = (
+            "candidates parts prose summary unit-test-not-a-real-key"
+        )
+        dirty[0]["model_response"] = {
+            "candidates": [
+                {
+                    "content": {
+                        "parts": [{"text": "PROSE SUMMARY SHOULD NOT LEAK"}],
+                    }
+                }
+            ],
+            "usageMetadata": {"totalTokenCount": 99},
+        }
+        dirty[0]["fields"]["carrier"]["confidence_score"] = 0.2
+        png = b"\x89PNG\r\n\x1a\nnot-a-real-image"
+        body = serve.build_browser_response(dirty, [png])
+        text = serve.public_json(body)
+        self.assertNotIn("unit-test-not-a-real-key", text)
+        self.assertNotIn("confidence", text)
+        self.assertNotIn("rates", text)
+        self.assertNotIn("candidates", text)
+        self.assertNotIn("PROSE SUMMARY SHOULD NOT LEAK", text)
+        self.assertNotIn("totalTokenCount", text)
+        self.assertNotIn("usageMetadata", text)
+        self.assertNotIn("generativelanguage", text)
+        self.assertNotIn("x-goog-api-key", text)
+        self.assertEqual(set(body), {"images", "records"})
+        self.assertEqual(body["images"][0]["page"], 1)
+        self.assertTrue(body["images"][0]["data_url"].startswith("data:image/png;base64,"))
+        self.assertGreaterEqual(len(body["records"]), 1)
+        self.assertTrue(body["records"][0]["usable"])
+        carrier = body["records"][0]["fields"]["carrier"]
+        self.assertEqual(carrier["status"], "found")
+        self.assertEqual(carrier["page"], 1)
+        self.assertIn("Northwind Dental", carrier["excerpt"])
+        annual = body["records"][0]["fields"]["annual_maximum"]["unlabeled"]
+        self.assertEqual(annual["status"], "found")
+        self.assertEqual(annual["value"]["normalized"], 1500)
+
+    def test_failure_keeps_rendered_images_and_one_blank_record(self):
+        import serve
+
+        with mock.patch.object(extract.urllib.request, "urlopen", side_effect=AssertionError("network")):
+            with mock.patch.object(
+                extract,
+                "execute_gemini_request",
+                return_value=(None, "gemini http 500: unit-test-not-a-real-key"),
+            ):
+                with tempfile.TemporaryDirectory() as tmp:
+                    pdf_path = Path(tmp) / "one.pdf"
+                    pdf_path.write_bytes(build_pdf(["Annual maximum $1,500"]))
+                    result = serve.extract_pdf_bytes(pdf_path.read_bytes())
+        text = serve.public_json(result)
+        self.assertNotIn("unit-test-not-a-real-key", text)
+        self.assertNotIn("generativelanguage", text)
+        self.assertNotIn("candidates", text)
+        self.assertEqual(set(result), {"images", "records"})
+        self.assertEqual(len(result["images"]), 1)
+        self.assertEqual(result["images"][0]["page"], 1)
+        self.assertEqual(len(result["records"]), 1)
+        self.assertFalse(result["records"][0]["usable"])
+        self.assertIn("[redacted]", result["records"][0]["failure_reason"])
+        assert_all_not_found(self, result["records"][0])
+
+    def test_http_post_returns_images_and_records_without_calling_google(self):
+        import threading
+        from http.client import HTTPConnection
+
+        import serve
+
+        fake_payload = {
+            "candidates": [
+                {
+                    "content": {
+                        "parts": [
+                            {
+                                "text": json.dumps(
+                                    plan_payload(
+                                        [
+                                            "Annual maximum: $1,500 per person",
+                                            "Preventive 100% / Basic 80% / Major 50%",
+                                        ]
+                                    )
+                                )
+                            }
+                        ]
+                    }
+                }
+            ],
+            "usageMetadata": {"totalTokenCount": 12},
+        }
+        httpd = serve.make_server("127.0.0.1", 0)
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        try:
+            port = httpd.server_address[1]
+            pdf = build_pdf(["Annual maximum: $1,500 per person"])
+            with mock.patch.object(extract.urllib.request, "urlopen", side_effect=AssertionError("network")):
+                with mock.patch.object(
+                    extract,
+                    "execute_gemini_request",
+                    return_value=(fake_payload, None),
+                ) as call:
+                    conn = HTTPConnection("127.0.0.1", port, timeout=30)
+                    conn.request(
+                        "POST",
+                        "/extract",
+                        body=pdf,
+                        headers={"Content-Type": "application/pdf", "Content-Length": str(len(pdf))},
+                    )
+                    response = conn.getresponse()
+                    raw = response.read().decode("utf-8")
+                    conn.close()
+            self.assertEqual(response.status, 200)
+            self.assertEqual(call.call_count, 1)
+            self.assertNotIn("unit-test-not-a-real-key", raw)
+            self.assertNotIn("candidates", raw)
+            self.assertNotIn("confidence", raw)
+            self.assertNotIn("totalTokenCount", raw)
+            self.assertNotIn("generativelanguage", raw)
+            payload = json.loads(raw)
+            self.assertEqual(set(payload), {"images", "records"})
+            self.assertEqual(len(payload["images"]), 1)
+            self.assertTrue(payload["records"][0]["usable"])
+            self.assertEqual(
+                payload["records"][0]["fields"]["annual_maximum"]["unlabeled"]["status"],
+                "found",
+            )
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+            thread.join(timeout=5)
+
+
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -3,6 +3,7 @@
 const statusEl = document.getElementById("status");
 const fileEl = document.getElementById("file");
 const pagesEl = document.getElementById("pages");
+const recordsEl = document.getElementById("records");
 
 const PDFJS_URL = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.8.69/pdf.min.mjs";
 const PDFJS_WORKER = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.8.69/pdf.worker.min.mjs";
@@ -10,6 +11,7 @@ const PDFJS_WORKER = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.8.69/pdf.w
 const NOT_EXTRACTED = "Nothing is extracted in the browser.";
 
 let pdfjsPromise = null;
+let requestSeq = 0;
 
 function setStatus(message, isError) {
   statusEl.textContent = message;
@@ -18,6 +20,10 @@ function setStatus(message, isError) {
 
 function clearPages() {
   pagesEl.replaceChildren();
+}
+
+function clearRecords() {
+  recordsEl.replaceChildren();
 }
 
 function loadPdfJs() {
@@ -33,6 +39,13 @@ function loadPdfJs() {
 function isPdfFile(file) {
   const name = (file.name || "").toLowerCase();
   return file.type === "application/pdf" || name.endsWith(".pdf");
+}
+
+function addText(parent, tag, text) {
+  const node = document.createElement(tag);
+  node.textContent = text;
+  parent.appendChild(node);
+  return node;
 }
 
 async function renderPdfPages(file) {
@@ -61,35 +74,199 @@ async function renderPdfPages(file) {
   return doc.numPages;
 }
 
-async function onRender() {
+function isPngDataUrl(value) {
+  return typeof value === "string" && /^data:image\/png;base64,[a-z0-9+/=\s]+$/i.test(value);
+}
+
+function showServerImages(images) {
   clearPages();
-  const button = document.getElementById("render");
-  button.disabled = true;
+  const list = Array.isArray(images) ? images : [];
+  list.forEach((image) => {
+    if (!image || !isPngDataUrl(image.data_url)) {
+      return;
+    }
+    const pageNumber = image.page;
+    const figure = document.createElement("figure");
+    const caption = document.createElement("figcaption");
+    caption.textContent = "Page " + pageNumber;
+    const img = document.createElement("img");
+    img.alt = "Page " + pageNumber + " from this extraction";
+    img.src = image.data_url;
+    figure.appendChild(caption);
+    figure.appendChild(img);
+    pagesEl.appendChild(figure);
+  });
+  return pagesEl.childElementCount;
+}
+
+function formatValue(value) {
+  if (!value || typeof value !== "object") {
+    return "(no value)";
+  }
+  const printed = typeof value.printed === "string" && value.printed ? value.printed : "";
+  const hasNormalized = value.normalized !== null && value.normalized !== undefined;
+  if (printed && hasNormalized) {
+    return printed + " (normalized " + String(value.normalized) + ")";
+  }
+  if (printed) {
+    return printed;
+  }
+  if (hasNormalized) {
+    return "normalized " + String(value.normalized);
+  }
+  return "(no value)";
+}
+
+function appendEvidence(parent, item) {
+  addText(parent, "p", "Value: " + formatValue(item && item.value)).className = "meta";
+  const page = item && item.page !== null && item.page !== undefined ? String(item.page) : "(none)";
+  addText(parent, "p", "Page: " + page).className = "meta";
+  addText(parent, "p", "Excerpt:").className = "meta";
+  const excerpt = document.createElement("pre");
+  excerpt.className = "excerpt";
+  excerpt.textContent = item && typeof item.excerpt === "string" ? item.excerpt : "";
+  parent.appendChild(excerpt);
+}
+
+function walkLeaves(node, path, rows) {
+  if (!node || typeof node !== "object") {
+    return;
+  }
+  if (node.status === "found" || node.status === "not_found" || node.status === "conflict") {
+    rows.push({ path: path, leaf: node });
+    return;
+  }
+  Object.keys(node).forEach((key) => {
+    walkLeaves(node[key], path ? path + "." + key : key, rows);
+  });
+}
+
+function showRecords(records) {
+  clearRecords();
+  if (!Array.isArray(records) || records.length === 0) {
+    addText(recordsEl, "p", "No plan records. This page does not guess benefits.");
+    return;
+  }
+  records.forEach((record, index) => {
+    const plan = document.createElement("article");
+    plan.className = "plan";
+    addText(plan, "h3", "Plan " + (index + 1));
+    const usable = record && record.usable === true;
+    addText(plan, "p", "usable: " + (usable ? "true" : "false")).className = "meta";
+    if (record && typeof record.failure_reason === "string" && record.failure_reason) {
+      addText(plan, "p", "failure_reason: " + record.failure_reason).className = "meta";
+    }
+    const rows = [];
+    walkLeaves(record && record.fields, "", rows);
+    if (rows.length === 0) {
+      addText(plan, "p", "No fields on this record.");
+    }
+    rows.forEach((row) => {
+      const leaf = row.leaf;
+      const block = document.createElement("div");
+      block.className = "leaf";
+      if (leaf.status === "not_found") {
+        block.className = "leaf not-found";
+        addText(block, "p", row.path + " — not_found");
+        plan.appendChild(block);
+        return;
+      }
+      if (leaf.status === "conflict") {
+        addText(block, "p", row.path + " — conflict");
+        const sides = Array.isArray(leaf.sides) ? leaf.sides : [];
+        sides.forEach((side, sideIndex) => {
+          addText(block, "p", "Side " + (sideIndex + 1));
+          appendEvidence(block, side);
+        });
+        plan.appendChild(block);
+        return;
+      }
+      addText(block, "p", row.path + " — found");
+      appendEvidence(block, leaf);
+      plan.appendChild(block);
+    });
+    recordsEl.appendChild(plan);
+  });
+}
+
+async function extractFile(file) {
+  const seq = ++requestSeq;
+  clearPages();
+  clearRecords();
+  fileEl.disabled = true;
+  setStatus("Sending the PDF to the extractor on this origin…");
   try {
-    const file = fileEl.files && fileEl.files[0];
-    if (!file) {
-      setStatus(NOT_EXTRACTED);
+    const response = await fetch(new URL("extract", window.location.href), {
+      method: "POST",
+      headers: { "Content-Type": "application/pdf" },
+      body: file,
+    });
+    if (seq !== requestSeq) {
       return;
     }
-    if (!isPdfFile(file)) {
-      setStatus(NOT_EXTRACTED + " Choose a PDF to render page images.");
-      return;
+    const data = await response.json();
+    if (!data || !Array.isArray(data.records)) {
+      throw new Error("The extractor did not return plan records.");
     }
-    const pageCount = await renderPdfPages(file);
-    const noun = pageCount === 1 ? "page" : "pages";
-    setStatus("Rendered " + pageCount + " " + noun + ". " + NOT_EXTRACTED);
+    const imageCount = showServerImages(data.images);
+    showRecords(data.records);
+    const pageNoun = imageCount === 1 ? "page image" : "page images";
+    setStatus(
+      "Showing " + imageCount + " " + pageNoun + " and " + data.records.length +
+      " plan record" + (data.records.length === 1 ? "" : "s") + ". " + NOT_EXTRACTED
+    );
   } catch (error) {
+    if (seq !== requestSeq) {
+      return;
+    }
+    clearRecords();
+    addText(recordsEl, "p", "No plan records. This page does not guess benefits. " + NOT_EXTRACTED);
     const message = error && error.message ? error.message : String(error);
-    setStatus(NOT_EXTRACTED + " Could not render the PDF: " + message, true);
+    try {
+      const pageCount = await renderPdfPages(file);
+      if (seq !== requestSeq) {
+        return;
+      }
+      const noun = pageCount === 1 ? "page" : "pages";
+      setStatus(
+        "This origin did not return an extraction (" + message + "). Rendered " +
+        pageCount + " " + noun + " locally. " + NOT_EXTRACTED,
+        true
+      );
+    } catch (renderError) {
+      const renderMessage = renderError && renderError.message ? renderError.message : String(renderError);
+      setStatus(NOT_EXTRACTED + " Could not extract or render the PDF: " + renderMessage, true);
+    }
   } finally {
-    button.disabled = false;
+    if (seq === requestSeq) {
+      fileEl.disabled = false;
+    }
   }
 }
 
-document.getElementById("render").addEventListener("click", onRender);
+fileEl.addEventListener("change", () => {
+  const file = fileEl.files && fileEl.files[0];
+  if (!file) {
+    clearPages();
+    clearRecords();
+    setStatus(NOT_EXTRACTED);
+    return;
+  }
+  if (!isPdfFile(file)) {
+    clearPages();
+    clearRecords();
+    setStatus(NOT_EXTRACTED + " Choose a PDF.");
+    return;
+  }
+  extractFile(file);
+});
+
 document.getElementById("clear-file").addEventListener("click", () => {
+  requestSeq += 1;
   fileEl.value = "";
+  fileEl.disabled = false;
   clearPages();
+  clearRecords();
   setStatus("File cleared. " + NOT_EXTRACTED);
 });
 

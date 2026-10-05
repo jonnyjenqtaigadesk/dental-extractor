@@ -1,6 +1,6 @@
 # Dental benefit summary extractor
 
-CLI only. A PDF is rendered to page images and those images are sent to Gemini. The public page renders the same kind of page images and does not extract benefits.
+A PDF is rendered to page images and those images are sent to Gemini from the local Python process. The public page does not hold the key and does not call the model.
 
 The key is the environment variable `GEMINI_API_KEY`, read at call time. It is not stored in this repo and it is not on the public page. No pip installs. Python 3 standard library plus `pdftoppm` from poppler.
 
@@ -13,7 +13,10 @@ python3 /workspace/dental-extractor/extract.py /path/to/summary.pdf
 python3 /workspace/dental-extractor/extract.py --text /path/to/summary.txt
 python3 /workspace/dental-extractor/extract.py < /path/to/summary.txt
 python3 /workspace/dental-extractor/test_extract.py
+python3 /workspace/dental-extractor/serve.py
 ```
+
+`serve.py` listens on `127.0.0.1:8765`. Choosing a PDF in that page posts the file to `POST /extract` on the same origin. The Python process renders pages with `pdftoppm` and calls Gemini. The JSON response is the page images from that run plus the coercer records (`found`, `not_found`, `conflict`, page, excerpt, value, usable, failure_reason). Raw model text, rates, confidence scores, tokens, and the API key are not in that response. `--text` and stdin are unchanged and do not call Gemini.
 
 A PDF is not read as text. Each page is rendered first:
 
@@ -65,6 +68,6 @@ The coercer, not a pixel guess, applies the benefit rules: class assignment only
 
 <https://jonnyjenqtaigadesk.github.io/dental-extractor/>
 
-The page renders a PDF with PDF.js `page.render` onto a canvas and states that nothing is extracted in the browser. It does not call Gemini and it has no benefit JSON.
+Nothing is extracted in the browser. The page posts the PDF to the same origin. GitHub Pages cannot run the model call, and there is no public proxy. When that post fails, the page can still draw page images with PDF.js `page.render` and does not guess benefits.
 
 Repo: <https://github.com/jonnyjenqtaigadesk/dental-extractor>
