@@ -52,7 +52,7 @@
 <body>
   <h1>Dental benefit summary extractor</h1>
   <p>Unofficial. Does not invent values. The parser is <a href="extract.py">extract.py</a> from this site, loaded unchanged and run in your browser with <a href="https://pyodide.org/">Pyodide</a>. Nothing is sent to a server.</p>
-  <p class="note">Pages are rendered to images first, then Tesseract reads those images. That is OCR, not a vision LLM, and it is not the PDF text layer. Pasted text and a .txt upload are not OCR'd. They go straight to <code>extract_text</code>.</p>
+  <p class="note">OCR removed. Images stay on the page. The vision call is not wired in the browser. Pasted text and a .txt upload still go straight to <code>extract_text</code>.</p>
 
   <label for="summary">Paste summary text</label>
   <textarea id="summary" spellcheck="false" placeholder="Paste a dental benefit summary here"></textarea>
@@ -71,7 +71,7 @@
   <pre id="json-out"></pre>
   <h2>Page images</h2>
   <div id="pages" class="pages"></div>
-  <h2>Text passed to extract_text</h2>
+  <h2>Text passed to extract_text (paste and .txt only)</h2>
   <pre id="text-out"></pre>
 
   <script src="https://cdn.jsdelivr.net/pyodide/v314.0.7/full/pyodide.js"></script>

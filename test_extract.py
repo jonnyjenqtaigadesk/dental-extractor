@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -261,12 +262,16 @@ class EvidenceTests(unittest.TestCase):
 
     def test_no_network_imports(self):
         source = (ROOT / "extract.py").read_text(encoding="utf-8")
-        for banned in ("urllib", "requests", "http.client", "socket", "pip "):
+        for banned in ("urllib", "requests", "http.client", "socket", "pip ", "tesseract", "pdftotext"):
             self.assertNotIn(banned, source)
         self.assertIn("pdftoppm", source)
-        self.assertIn("tesseract", source)
-        self.assertNotIn("pdftotext", source)
+        self.assertIn("GEMINI_MODEL", source)
+        self.assertIn("CALLS_ENABLED = False", source)
         self.assertIn("subprocess", source)
+        self.assertIn(
+            "quote the page verbatim in evidence, and if it is not printed, status not_found",
+            source,
+        )
 
 
 class CliTests(unittest.TestCase):
@@ -307,7 +312,7 @@ class CliTests(unittest.TestCase):
             [],
         )
 
-    def test_pdf_uses_pdftoppm_and_tesseract_not_pdftotext(self):
+    def test_pdf_renders_images_and_does_not_call_ocr_or_network(self):
         lines = [
             "This is a PPO plan.",
             "Per person annual maximum: $1,500",
@@ -320,11 +325,16 @@ class CliTests(unittest.TestCase):
             pdf_path.write_bytes(build_pdf(lines))
             bin_dir = tmp_path / "bin"
             bin_dir.mkdir()
-            fake = bin_dir / "pdftotext"
-            fake.write_text("#!/bin/sh\necho pdftotext-should-not-run >&2\nexit 99\n", encoding="utf-8")
-            fake.chmod(0o755)
+            marker = tmp_path / "banned-calls"
+            script = "#!/bin/sh\nprintf '%s\\n' \"$0\" >> " + str(marker) + "\nexit 99\n"
+            for name in ("tesseract", "pdftotext", "curl", "wget"):
+                fake = bin_dir / name
+                fake.write_text(script, encoding="utf-8")
+                fake.chmod(0o755)
             env = os.environ.copy()
+            env.pop("GEMINI_API_KEY", None)
             env["PATH"] = str(bin_dir) + os.pathsep + env.get("PATH", "")
+            before = set(Path(tempfile.gettempdir()).glob("dental-pdf-*"))
             proc = subprocess.run(
                 [sys.executable, str(ROOT / "extract.py"), str(pdf_path)],
                 capture_output=True,
@@ -332,27 +342,25 @@ class CliTests(unittest.TestCase):
                 check=False,
                 env=env,
             )
-            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
-            self.assertNotIn("pdftotext-should-not-run", proc.stderr)
+            after = set(Path(tempfile.gettempdir()).glob("dental-pdf-*"))
+            self.assertEqual(proc.returncode, 2, proc.stderr + proc.stdout)
+            self.assertFalse(marker.exists(), marker.read_text() if marker.exists() else "")
+            self.assertEqual(after, before)
             payload = json.loads(proc.stdout)
-            self.assertTrue(payload["ok"])
-            self.assertEqual(payload["source"]["kind"], "pdf-image-ocr")
-            self.assertEqual(payload["source"]["pages"], 1)
-            ocr_text, err, pages = extract.pdf_to_text(str(pdf_path))
-            self.assertIsNone(err)
-            self.assertEqual(pages, 1)
-            self.assertTrue(ocr_text)
-            assert_leaf_rules(self, ocr_text, payload["fields"])
-            self.assertEqual(payload["fields"], extract.extract_text(ocr_text)["fields"])
-            self.assertEqual(payload["fields"]["plan_type"]["value"], "PPO")
             self.assertEqual(
-                payload["fields"]["annual_or_contract_maximum"]["amount_per_person"]["value"],
-                "$1,500",
+                payload,
+                {
+                    "ok": False,
+                    "error": "vision model not confirmed",
+                    "source": {
+                        "kind": "pdf-images",
+                        "name": str(pdf_path),
+                        "page_count": 1,
+                        "provider": "gemini",
+                    },
+                },
             )
-            self.assertEqual(
-                payload["fields"]["plan_pay_percent_by_class"]["Diagnostic and Preventive"]["in_network"]["value"],
-                "100%",
-            )
+            self.assertNotIn("fields", payload)
 
     def test_bad_pdf_is_json_error(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -381,6 +389,168 @@ class CliTests(unittest.TestCase):
         payload = json.loads(proc.stdout)
         self.assertFalse(payload["ok"])
         self.assertIn("not found", payload["error"].lower())
+
+
+class GeminiPrepTests(unittest.TestCase):
+    def test_quote_filter_blank_evidence_is_not_found(self):
+        for raw in (
+            {"status": "found", "value": "100%", "evidence": ""},
+            {"status": "found", "value": "100%", "evidence": "   "},
+            {"status": "found", "value": "100%"},
+            {"status": "found", "value": "PPO", "evidence": None},
+        ):
+            leaf = extract.coerce_model_leaf(raw)
+            self.assertEqual(leaf["status"], "not_found")
+            self.assertIsNone(leaf["value"])
+            self.assertIsNone(leaf["evidence"])
+        fields = extract.fields_from_gemini(
+            {
+                "fields": {
+                    "plan_type": {"status": "found", "value": "PPO", "evidence": ""},
+                    "implants": {"status": "found", "value": "covered"},
+                    "plan_pay_percent_by_class": {
+                        "Major Restorative": {
+                            "in_network": {
+                                "status": "found",
+                                "value": "50%",
+                                "evidence": "Major Restorative 50%",
+                            },
+                            "out_of_network": {
+                                "status": "found",
+                                "value": "40%",
+                                "evidence": "",
+                            },
+                        }
+                    },
+                }
+            }
+        )
+        self.assertEqual(fields["plan_type"]["status"], "not_found")
+        self.assertIsNone(fields["plan_type"]["value"])
+        self.assertEqual(fields["implants"]["status"], "not_found")
+        row = fields["plan_pay_percent_by_class"]["Major Restorative"]
+        self.assertEqual(row["in_network"]["status"], "found")
+        self.assertEqual(row["in_network"]["evidence"], "Major Restorative 50%")
+        self.assertEqual(row["out_of_network"]["status"], "not_found")
+        self.assertIsNone(row["out_of_network"]["value"])
+        self.assertNotIn("Class III", fields["plan_pay_percent_by_class"])
+        self.assertNotIn("Major", fields["plan_pay_percent_by_class"])
+
+    def test_model_prose_is_not_regex_parsed(self):
+        payload = {
+            "candidates": [
+                {
+                    "content": {
+                        "parts": [
+                            {
+                                "text": "This is a PPO plan.\nPer person annual maximum: $1,500\n",
+                            }
+                        ]
+                    }
+                }
+            ]
+        }
+        fields = extract.parse_gemini_response(payload)
+        found = [path for path, leaf in leaves(fields) if leaf["status"] == "found"]
+        self.assertEqual(found, [])
+        quoted = extract.parse_gemini_response(
+            {
+                "candidates": [
+                    {
+                        "content": {
+                            "parts": [
+                                {
+                                    "text": json.dumps(
+                                        {
+                                            "fields": {
+                                                "plan_type": {
+                                                    "status": "found",
+                                                    "value": "PPO",
+                                                    "evidence": "This is a PPO plan.",
+                                                }
+                                            }
+                                        }
+                                    )
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }
+        )
+        self.assertEqual(quoted["plan_type"]["status"], "found")
+        self.assertEqual(quoted["plan_type"]["value"], "PPO")
+        self.assertEqual(quoted["plan_type"]["evidence"], "This is a PPO plan.")
+        self.assertEqual(quoted["annual_or_contract_maximum"]["amount_per_person"]["status"], "not_found")
+
+    def test_missing_key_builds_no_request_and_does_not_use_network(self):
+        import socket
+
+        previous = os.environ.pop("GEMINI_API_KEY", None)
+        try:
+            blocked = extract.prepare_gemini_request([b"png"])
+            self.assertEqual(blocked, {"ok": False, "error": "GEMINI_API_KEY is not set"})
+            lines = ["This is a PPO plan."]
+            with tempfile.TemporaryDirectory() as tmp:
+                pdf_path = Path(tmp) / "sample.pdf"
+                pdf_path.write_bytes(build_pdf(lines))
+                commands = []
+                real_run = extract.subprocess.run
+
+                def wrapped(cmd, *args, **kwargs):
+                    commands.append(list(cmd))
+                    if cmd[0] != "pdftoppm":
+                        raise AssertionError("unexpected command " + str(cmd[0]))
+                    return real_run(cmd, *args, **kwargs)
+
+                def no_network(*args, **kwargs):
+                    raise AssertionError("network")
+
+                with mock.patch.object(extract.subprocess, "run", wrapped):
+                    with mock.patch.object(extract, "extract_text", side_effect=AssertionError("extract_text")):
+                        with mock.patch.object(socket, "socket", no_network):
+                            with mock.patch.object(extract, "CALLS_ENABLED", True):
+                                from io import StringIO
+
+                                buf = StringIO()
+                                with mock.patch.object(sys, "stdout", buf):
+                                    code = extract.run([str(pdf_path)])
+                self.assertEqual(code, 1, buf.getvalue())
+                self.assertEqual(commands[0][0], "pdftoppm")
+                self.assertIn("200", commands[0])
+                self.assertEqual(json.loads(buf.getvalue())["error"], "GEMINI_API_KEY is not set")
+                self.assertNotIn("fields", json.loads(buf.getvalue()))
+        finally:
+            if previous is not None:
+                os.environ["GEMINI_API_KEY"] = previous
+
+    def test_request_shape_is_unsent(self):
+        import socket
+
+        previous = os.environ.pop("GEMINI_API_KEY", None)
+        os.environ["GEMINI_API_KEY"] = "x"
+        try:
+            def no_network(*args, **kwargs):
+                raise AssertionError("network")
+
+            with mock.patch.object(socket, "socket", no_network):
+                request = extract.build_gemini_request([b"png-bytes"])
+            self.assertEqual(extract.GEMINI_MODEL, "gemini-3.8-flash")
+            self.assertFalse(extract.CALLS_ENABLED)
+            self.assertIn("/models/gemini-3.8-flash:generateContent", request["url"])
+            self.assertEqual(request["headers"]["x-goog-api-key"], "x")
+            self.assertEqual(request["headers"]["Content-Type"], "application/json")
+            parts = request["body"]["contents"][0]["parts"]
+            self.assertEqual(parts[0]["text"][:1], "Y")
+            image = parts[1]["inline_data"]
+            self.assertEqual(image["mime_type"], "image/png")
+            self.assertEqual(image["data"], "cG5nLWJ5dGVz")
+            self.assertNotIn("fields", request)
+        finally:
+            os.environ.pop("GEMINI_API_KEY", None)
+            if previous is not None:
+                os.environ["GEMINI_API_KEY"] = previous
+
 
 
 if __name__ == "__main__":

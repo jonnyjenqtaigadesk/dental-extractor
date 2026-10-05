@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Extract dental plan-design fields from a summary.
 
-Pure Python 3. A PDF is rendered to page images with pdftoppm, then those
-images are read with the tesseract binary. extract_text sees that OCR text.
-This is not a vision LLM. Every benefit leaf is found only when a
-verbatim evidence quote is a substring of the source text. Nothing is
-filled from general dental knowledge.
+Pure Python 3. Pasted text, stdin, and --text go through extract_text.
+A PDF is rendered to PNG page images with pdftoppm. Those images are
+prepared for Google Gemini and are not read by extract_text. Vision calls
+stay off until GEMINI_API_KEY is confirmed. Nothing is filled from general
+dental knowledge.
 
 NADP class names (Class I / II / III) are NOT used as defaults.
 """
@@ -13,7 +13,9 @@ NADP class names (Class I / II / III) are NOT used as defaults.
 from __future__ import annotations
 
 import argparse
+import base64
 import json
+import os
 import re
 import subprocess
 import sys
@@ -810,13 +812,219 @@ def extract_text(text: str) -> dict[str, Any]:
     }
 
 
-def pdf_to_text(path: str) -> tuple[str | None, str | None, int | None]:
-    """Render each page to a PNG, then OCR those images.
 
-    Returns (text, error, page_count). Page texts are joined with a blank
-    line. The PDF text layer is not read. Empty OCR text is not an error.
+# Gemini vision. The request is built and not sent.
+# https://ai.google.dev/gemini-api/docs/models/gemini-3.8-flash
+# Current stable Flash model. Inputs include images. Output is text.
+# Image-generation Flash ids are a different task and are not used.
+CALLS_ENABLED = False
+GEMINI_MODEL = "gemini-3.8-flash"
+GEMINI_URL = (
+    "https://generativelanguage.googleapis.com/v1beta/models/"
+    + GEMINI_MODEL
+    + ":generateContent"
+)
+
+GEMINI_PROMPT = """You are reading page images of one dental benefit summary. Return a single JSON object and nothing else. The object has a "fields" member and no other top-level members.
+
+Each leaf is {"status": "found", "value": "<printed text>", "evidence": "<verbatim quote from the page>"} or {"status": "not_found", "value": null, "evidence": null}.
+
+quote the page verbatim in evidence, and if it is not printed, status not_found.
+
+Do not infer, calculate, or fill any field from general dental knowledge. Do not rename printed class names and do not map them onto NADP class numbers. Use only the class name printed on the page.
+
+Use only these slots:
+- cost_share.in_network
+- cost_share.out_of_network
+- cost_share.second_network
+- annual_or_contract_maximum.amount_per_person
+- annual_or_contract_maximum.period
+- annual_maximum_carryover
+- deductible.per_person
+- deductible.family_maximum
+- deductible.waived_for_diagnostic_and_preventive
+- deductible.waived_for_orthodontics
+- plan_pay_percent_by_class.<printed class name>.in_network
+- plan_pay_percent_by_class.<printed class name>.out_of_network
+- plan_pay_percent_by_class.<printed class name>.second_network only when a third network column is printed
+- diagnostic_preventive_excluded_from_annual_maximum
+- orthodontics.lifetime_maximum
+- orthodontics.adult_eligibility
+- orthodontics.child_eligibility
+- orthodontics.one_course_per_lifetime
+- waiting_periods.collection
+- waiting_periods.by_class.<printed class name>
+- frequencies.<slot>.frequency
+- frequencies.<slot>.age_limit
+- frequencies.<slot>.replacement_period
+Frequency slots: exams, cleanings, bitewings, full_mouth_or_panoramic, fluoride, sealants, space_maintainers, fillings, crowns, dentures, bridges, implants, root_canal, periodontal_surgery, scaling_and_root_planing, periodontal_maintenance.
+- implants
+- alternate_benefit_or_least_costly_treatment
+- cosmetic_exclusion
+- missing_tooth_clause
+- tmj
+- coordination_of_benefits
+- allowed_amount_basis
+- pretreatment_estimate
+- dependent_age
+- plan_type
+"""
+
+
+def coerce_model_leaf(raw: Any) -> Leaf:
+    """Found only when the model returned a non-empty evidence string.
+
+    Missing or blank evidence is forced to not_found. Values are not
+    invented and the regex parser is not used.
     """
-    with tempfile.TemporaryDirectory(prefix="dental-ocr-") as tmp:
+    if not isinstance(raw, dict):
+        return empty_leaf()
+    evidence = raw.get("evidence")
+    if not isinstance(evidence, str) or evidence.strip() == "":
+        return empty_leaf()
+    value = raw.get("value")
+    if value is None or isinstance(value, bool):
+        return empty_leaf()
+    if isinstance(value, str) and value.strip() == "":
+        return empty_leaf()
+    return {"status": "found", "value": value, "evidence": evidence}
+
+
+def _merge_class_map(dest: dict[str, Any], src: Any) -> None:
+    if not isinstance(src, dict):
+        return
+    for label, bucket in src.items():
+        if not isinstance(label, str) or not label.strip() or not isinstance(bucket, dict):
+            continue
+        out = {
+            "in_network": coerce_model_leaf(bucket.get("in_network")),
+            "out_of_network": coerce_model_leaf(bucket.get("out_of_network")),
+        }
+        if "second_network" in bucket:
+            out["second_network"] = coerce_model_leaf(bucket.get("second_network"))
+        if any(leaf["status"] == "found" for leaf in out.values()):
+            dest[label] = out
+
+
+def _merge_waiting_classes(dest: dict[str, Any], src: Any) -> None:
+    if not isinstance(src, dict):
+        return
+    for label, leaf in src.items():
+        if isinstance(label, str) and label.strip():
+            dest[label] = coerce_model_leaf(leaf)
+
+
+def _merge_model_tree(dest: dict[str, Any], src: Any) -> None:
+    if not isinstance(src, dict):
+        return
+    for key, dest_value in list(dest.items()):
+        if key not in src:
+            continue
+        src_value = src[key]
+        if is_leaf(dest_value):
+            coerced = coerce_model_leaf(src_value)
+            dest_value.clear()
+            dest_value.update(coerced)
+        elif key == "plan_pay_percent_by_class":
+            _merge_class_map(dest_value, src_value)
+        elif key == "by_class":
+            _merge_waiting_classes(dest_value, src_value)
+        elif isinstance(dest_value, dict):
+            _merge_model_tree(dest_value, src_value)
+
+
+def fields_from_gemini(model_json: Any) -> dict[str, Any]:
+    """Apply the evidence filter to a model JSON object. No regex parser."""
+    fields = skeleton()
+    raw = model_json
+    if isinstance(model_json, dict) and isinstance(model_json.get("fields"), dict):
+        raw = model_json["fields"]
+    if isinstance(raw, dict):
+        _merge_model_tree(fields, raw)
+    return fields
+
+
+def parse_gemini_response(payload: Any) -> dict[str, Any]:
+    """Parse a generateContent JSON body into filtered fields.
+
+    The model text is JSON only. If it is not JSON, every leaf stays
+    not_found. The regex parser does not see the model text.
+    """
+    if not isinstance(payload, dict):
+        return skeleton()
+    text_parts: list[str] = []
+    candidates = payload.get("candidates")
+    if isinstance(candidates, list):
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                continue
+            content = candidate.get("content")
+            if not isinstance(content, dict):
+                continue
+            parts = content.get("parts")
+            if not isinstance(parts, list):
+                continue
+            for part in parts:
+                if isinstance(part, dict) and isinstance(part.get("text"), str):
+                    text_parts.append(part["text"])
+            if text_parts:
+                break
+    if not text_parts:
+        if isinstance(payload.get("fields"), dict):
+            return fields_from_gemini(payload)
+        return skeleton()
+    try:
+        decoded = json.loads("\n".join(text_parts))
+    except json.JSONDecodeError:
+        return skeleton()
+    return fields_from_gemini(decoded)
+
+
+def build_gemini_request(page_pngs: list[bytes]) -> dict[str, Any]:
+    """Build the generateContent request. Does not send it.
+
+    The key is read from the environment at call time, never from a file.
+    """
+    key = os.environ["GEMINI_API_KEY"]
+    parts: list[dict[str, Any]] = [{"text": GEMINI_PROMPT}]
+    for png in page_pngs:
+        parts.append(
+            {
+                "inline_data": {
+                    "mime_type": "image/png",
+                    "data": base64.b64encode(png).decode("ascii"),
+                }
+            }
+        )
+    return {
+        "url": GEMINI_URL,
+        "headers": {
+            "Content-Type": "application/json",
+            "x-goog-api-key": key,
+        },
+        "body": {
+            "contents": [{"role": "user", "parts": parts}],
+            "generationConfig": {"responseMimeType": "application/json"},
+        },
+    }
+
+
+def prepare_gemini_request(page_pngs: list[bytes]) -> dict[str, Any]:
+    """Return the unsent request, or an error if the key is missing.
+
+    This never contacts the network. A missing key does not fall through to a call.
+    """
+    try:
+        if os.environ["GEMINI_API_KEY"] == "":
+            return {"ok": False, "error": "GEMINI_API_KEY is not set"}
+    except KeyError:
+        return {"ok": False, "error": "GEMINI_API_KEY is not set"}
+    return {"ok": True, "request": build_gemini_request(page_pngs)}
+
+
+def render_pdf_pages(path: str) -> tuple[list[bytes] | None, str | None]:
+    """Render each PDF page to a PNG at 200 DPI. Temp files are removed."""
+    with tempfile.TemporaryDirectory(prefix="dental-pdf-") as tmp:
         prefix = str(Path(tmp) / "page")
         try:
             render = subprocess.run(
@@ -828,34 +1036,22 @@ def pdf_to_text(path: str) -> tuple[str | None, str | None, int | None]:
                 check=False,
             )
         except FileNotFoundError:
-            return None, "pdftoppm is not installed", None
+            return None, "pdftoppm is not installed"
         if render.returncode != 0:
             detail = (render.stderr or render.stdout or "pdftoppm failed").strip()
-            return None, f"pdftoppm failed: {detail}", None
+            return None, f"pdftoppm failed: {detail}"
         pages = sorted(
             Path(tmp).glob("page-*.png"),
             key=lambda image: int(image.stem.rsplit("-", 1)[-1]),
         )
         if not pages:
-            return None, "pdftoppm produced no page images", None
-        texts: list[str] = []
+            return None, "pdftoppm produced no page images"
+        images: list[bytes] = []
         for image in pages:
-            try:
-                ocr = subprocess.run(
-                    ["tesseract", str(image), "stdout", "-l", "eng"],
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    check=False,
-                )
-            except FileNotFoundError:
-                return None, "tesseract is not installed", None
-            if ocr.returncode != 0:
-                detail = (ocr.stderr or ocr.stdout or "tesseract failed").strip()
-                return None, f"tesseract failed: {detail}", None
-            texts.append(ocr.stdout.rstrip("\n"))
-        return "\n\n".join(texts), None, len(pages)
+            images.append(image.read_bytes())
+            image.unlink()
+        return images, None
+
 
 
 def emit(payload: dict[str, Any]) -> None:
@@ -888,18 +1084,31 @@ def run(argv: list[str] | None = None) -> int:
             result = extract_text(text)
             result["source"] = {"kind": "stdin", "name": None}
         elif args.file.lower().endswith(".pdf"):
-            text, err, page_count = pdf_to_text(args.file)
+            images, err = render_pdf_pages(args.file)
             if err:
-                emit(error_payload(err, "pdf-image-ocr", args.file))
+                emit({"ok": False, "error": err})
                 return 1
-            result = extract_text(text or "")
-            result["source"] = {
-                "kind": "pdf-image-ocr",
-                "name": args.file,
-                "pages": page_count,
+            page_count = len(images or [])
+            blocked = {
+                "ok": False,
+                "error": "vision model not confirmed",
+                "source": {
+                    "kind": "pdf-images",
+                    "name": args.file,
+                    "page_count": page_count,
+                    "provider": "gemini",
+                },
             }
-            if not (text or "").strip():
-                result["warnings"] = ["OCR returned no text"]
+            if not CALLS_ENABLED:
+                emit(blocked)
+                return 2
+            prepared = prepare_gemini_request(images or [])
+            if not prepared["ok"]:
+                emit({"ok": False, "error": prepared["error"]})
+                return 1
+            # The request in prepared["request"] is not executed.
+            emit(blocked)
+            return 2
         else:
             text = read_text_file(args.file)
             result = extract_text(text)

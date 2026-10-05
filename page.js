@@ -10,14 +10,11 @@ const pagesEl = document.getElementById("pages");
 
 const PDFJS_URL = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.8.69/pdf.min.mjs";
 const PDFJS_WORKER = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.8.69/pdf.worker.min.mjs";
-const TESSERACT_URL = "https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js";
-const TESSERACT_WORKER = "https://cdn.jsdelivr.net/npm/tesseract.js@v5.1.1/dist/worker.min.js";
-const TESSERACT_CORE = "https://cdn.jsdelivr.net/npm/tesseract.js-core@v5.1.1";
-const TESSERACT_LANG = "https://cdn.jsdelivr.net/npm/@tesseract.js-data/eng/4.0.0_best_int";
+
+const NOT_CALLED = "Pages rendered. Gemini is not called from this page, so no plan fields were extracted.";
 
 let pyodidePromise = null;
 let pdfjsPromise = null;
-let tesseractPromise = null;
 
 function setStatus(message, isError) {
   statusEl.textContent = message;
@@ -80,97 +77,47 @@ function loadPdfJs() {
   return pdfjsPromise;
 }
 
-function loadTesseract() {
-  if (window.Tesseract && typeof window.Tesseract.createWorker === "function") {
-    return Promise.resolve(window.Tesseract);
-  }
-  if (!tesseractPromise) {
-    tesseractPromise = new Promise((resolve, reject) => {
-      const script = document.createElement("script");
-      script.src = TESSERACT_URL;
-      script.async = true;
-      script.onload = () => {
-        if (!window.Tesseract || typeof window.Tesseract.createWorker !== "function") {
-          reject(new Error("Tesseract.js loaded but createWorker is missing"));
-          return;
-        }
-        resolve(window.Tesseract);
-      };
-      script.onerror = () => reject(new Error("Could not load Tesseract.js from " + TESSERACT_URL));
-      document.head.appendChild(script);
-    }).catch((error) => {
-      tesseractPromise = null;
-      throw error;
-    });
-  }
-  return tesseractPromise;
-}
-
 function isPdfFile(file) {
   const name = (file.name || "").toLowerCase();
   return file.type === "application/pdf" || name.endsWith(".pdf");
 }
 
-async function pdfFileToOcr(file) {
+async function renderPdfPages(file) {
   const pdfjs = await loadPdfJs();
-  const TesseractLib = await loadTesseract();
   const data = new Uint8Array(await file.arrayBuffer());
   const doc = await pdfjs.getDocument({ data: data }).promise;
   clearPages();
-  const worker = await TesseractLib.createWorker("eng", 1, {
-    workerPath: TESSERACT_WORKER,
-    corePath: TESSERACT_CORE,
-    langPath: TESSERACT_LANG,
-  });
-  const pageTexts = [];
-  try {
-    for (let i = 1; i <= doc.numPages; i++) {
-      setStatus("Rendering page " + i + " of " + doc.numPages + " to an image…");
-      const page = await doc.getPage(i);
-      const viewport = page.getViewport({ scale: 2 });
-      const canvas = document.createElement("canvas");
-      canvas.width = Math.ceil(viewport.width);
-      canvas.height = Math.ceil(viewport.height);
-      const context = canvas.getContext("2d", { alpha: false });
-      context.fillStyle = "#ffffff";
-      context.fillRect(0, 0, canvas.width, canvas.height);
-      await page.render({ canvasContext: context, viewport: viewport }).promise;
-      const figure = document.createElement("figure");
-      const caption = document.createElement("figcaption");
-      caption.textContent = "Page " + i;
-      figure.appendChild(caption);
-      figure.appendChild(canvas);
-      pagesEl.appendChild(figure);
-      setStatus("Tesseract is reading the image of page " + i + " of " + doc.numPages + "…");
-      const recognized = await worker.recognize(canvas);
-      const text = recognized && recognized.data && recognized.data.text ? recognized.data.text : "";
-      pageTexts.push(text.replace(/\s+$/, ""));
-    }
-  } finally {
-    await worker.terminate();
+  for (let i = 1; i <= doc.numPages; i++) {
+    setStatus("Rendering page " + i + " of " + doc.numPages + "…");
+    const page = await doc.getPage(i);
+    const viewport = page.getViewport({ scale: 2 });
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.ceil(viewport.width);
+    canvas.height = Math.ceil(viewport.height);
+    const context = canvas.getContext("2d", { alpha: false });
+    context.fillStyle = "#ffffff";
+    context.fillRect(0, 0, canvas.width, canvas.height);
+    await page.render({ canvasContext: context, viewport: viewport }).promise;
+    const figure = document.createElement("figure");
+    const caption = document.createElement("figcaption");
+    caption.textContent = "Page " + i;
+    figure.appendChild(caption);
+    figure.appendChild(canvas);
+    pagesEl.appendChild(figure);
   }
-  return pageTexts.join("\n\n");
+  return doc.numPages;
 }
 
 async function inputText() {
   const file = fileEl.files && fileEl.files[0];
   if (file) {
-    if (isPdfFile(file)) {
-      setStatus("Rendering the PDF to page images…");
-      return {
-        label: "pdf images then Tesseract OCR, not a vision LLM: " + (file.name || "upload"),
-        text: await pdfFileToOcr(file),
-        ocr: true,
-      };
-    }
     setStatus("Reading text file…");
     return {
       label: "text file: " + (file.name || "upload"),
       text: await file.text(),
-      ocr: false,
     };
   }
-  return { label: "pasted text", text: summaryEl.value, ocr: false };
+  return { label: "pasted text", text: summaryEl.value };
 }
 
 async function extract(text) {
@@ -193,21 +140,31 @@ async function onRun() {
   const button = document.getElementById("run");
   button.disabled = true;
   try {
-    const source = await inputText();
-    if (source.ocr && !String(source.text || "").trim()) {
-      setStatus("OCR returned no text. Benefits stay not_found.");
-    } else {
-      setStatus("Running extract_text from " + extractPyUrl().href + " …");
+    const file = fileEl.files && fileEl.files[0];
+    if (file && isPdfFile(file)) {
+      const pageCount = await renderPdfPages(file);
+      const payload = {
+        ok: false,
+        error: "vision model not confirmed",
+        source: {
+          kind: "pdf-images",
+          page_count: pageCount,
+          provider: "gemini",
+        },
+      };
+      summaryOut.textContent = NOT_CALLED;
+      jsonOut.textContent = JSON.stringify(payload, null, 2);
+      textOut.textContent = "";
+      setStatus(NOT_CALLED);
+      return;
     }
+    const source = await inputText();
+    setStatus("Running extract_text from " + extractPyUrl().href + " …");
     const result = await extract(source.text);
     summaryOut.textContent = result.readable_summary || "";
     jsonOut.textContent = JSON.stringify(result, null, 2);
     textOut.textContent = source.text;
-    if (source.ocr && !String(source.text || "").trim()) {
-      setStatus("Done. OCR returned no text, so benefits stay not_found. Source: " + source.label + ".");
-    } else {
-      setStatus("Done. Source: " + source.label + ".");
-    }
+    setStatus("Done. Source: " + source.label + ".");
   } catch (error) {
     const message = error && error.stack ? String(error.stack) : String(error);
     jsonOut.textContent = message;
@@ -224,7 +181,7 @@ document.getElementById("clear-file").addEventListener("click", () => {
 });
 
 loadRuntime()
-  .then(() => setStatus("Ready. Python loaded extract.py from this site. A PDF is rendered to images, then Tesseract reads those images. This is not a vision LLM."))
+  .then(() => setStatus("Ready. Paste or a .txt file runs extract_text in the browser. A PDF is rendered to images only. No plan fields are read from those images on this page."))
   .catch((error) => {
     const message = error && error.stack ? String(error.stack) : String(error);
     jsonOut.textContent = message;

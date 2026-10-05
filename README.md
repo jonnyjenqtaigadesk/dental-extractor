@@ -1,8 +1,8 @@
 # Dental benefit summary extractor
 
-Local CLI for other agents. It reads a pasted text summary or a PDF and returns one JSON object. Every benefit value is either quoted from the text that was parsed or explicitly `not_found`. It does not invent numbers, percents, ages, waiting periods, class mappings, or yes/no answers.
+Local CLI for other agents. It reads a pasted text summary or a PDF and returns one JSON object. For pasted text, stdin, and `--text`, every benefit value is either quoted from that text or explicitly `not_found`. It does not invent numbers, percents, ages, waiting periods, class mappings, or yes/no answers.
 
-No network. No API keys. No pip installs. No vision-model API. Python 3 standard library plus the `pdftoppm` binary from poppler and the `tesseract` binary.
+OCR is removed. A PDF is rendered to page images. Gemini is the intended reader of those images. Calls are off until `GEMINI_API_KEY` is confirmed. The public page does not contain the key. No pip installs. Python 3 standard library plus the `pdftoppm` binary from poppler.
 
 ## How to run
 
@@ -15,18 +15,23 @@ python3 /workspace/dental-extractor/extract.py -
 python3 /workspace/dental-extractor/test_extract.py
 ```
 
-Stdout is one JSON object (`ok`, `source`, `fields`, `notes`, `readable_summary`). `notes` is a list of short verbatim evidence snippets. For a PDF, `source.kind` is `pdf-image-ocr` and `source.pages` is the number of rendered pages.
+Stdout for pasted text, stdin, and `--text` is one JSON object (`ok`, `source`, `fields`, `notes`, `readable_summary`). `notes` is a list of short verbatim evidence snippets. `extract_text` is only for those text inputs. It is not run on PDF contents.
 
-A PDF is not read from its text layer. Each page is rendered to a PNG, then Tesseract OCRs those images, and that string is passed to `extract_text`:
+A PDF is not read as text. Each page is rendered to a PNG:
 
 ```bash
 pdftoppm -png -r 200 <file.pdf> <prefix>
-tesseract <prefix>-1.png stdout -l eng
 ```
 
-Page texts are joined with a blank line. If rendering or Tesseract fails, the process exits non-zero and prints `{"ok": false, "error": "..."}`. It does not guess the plan. If OCR returns no text, benefits stay `not_found` and `warnings` says OCR returned no text.
+Those images are prepared for Gemini (`GEMINI_MODEL`, currently `gemini-3.8-flash`) as inline `image/png` parts on `generateContent`. The request is built in code and is not sent. `CALLS_ENABLED` is `False` until the key is confirmed. After a successful render the process deletes the temp PNGs, prints this, and exits 2:
 
-Pasted text, stdin, and `--text` go straight to `extract_text`. They are not OCR'd.
+```json
+{"ok": false, "error": "vision model not confirmed", "source": {"kind": "pdf-images", "name": "<path>", "page_count": 1, "provider": "gemini"}}
+```
+
+There are no benefit fields in that object. If rendering fails, the process exits non-zero and prints `{"ok": false, "error": "<render error>"}` with no benefits. If calls were enabled and `GEMINI_API_KEY` were missing, the result would be `{"ok": false, "error": "GEMINI_API_KEY is not set"}` and still no network call. The key is read only from the environment at call time, never from a file.
+
+Model id: `gemini-3.8-flash`. Doc: <https://ai.google.dev/gemini-api/docs/models/gemini-3.8-flash>. That page lists it as the current stable Flash model and says its inputs include images and its output is text. Image-generation Flash models are a different task, so they are not used. The same id is the image-understanding example on <https://ai.google.dev/gemini-api/docs/generate-content/image-understanding>.
 
 ## No-invent rule
 
@@ -42,7 +47,9 @@ or:
 {"status": "not_found", "value": null, "evidence": null}
 ```
 
-`status: found` requires `evidence` to be an exact substring of the text passed to `extract_text`. For a PDF, that text is the Tesseract OCR of the rendered page images. If it cannot be quoted, the leaf is `not_found` and `value` is null. A number in `value` must appear in that quote. Words such as "eighty percent" are not rewritten as 80. An absent slot is empty. It is not filled from general dental knowledge, and it is not stored as `false`.
+For text inputs, `status: found` requires `evidence` to be an exact substring of the text passed to `extract_text`. If it cannot be quoted, the leaf is `not_found` and `value` is null. A number in `value` must appear in that quote. Words such as "eighty percent" are not rewritten as 80. An absent slot is empty. It is not filled from general dental knowledge, and it is not stored as `false`.
+
+For a PDF, the regex parser does not run. A Gemini field would be `found` only when the model returned a non-empty evidence string. Missing or blank evidence is forced to `not_found` with `value` null. That response parser is not executed while calls are off.
 
 If the document waives the deductible for preventive only, the orthodontic waiver stays `not_found`. If it says orthodontics is for children only, adult eligibility stays `not_found` unless adult eligibility is also printed. If it never mentions waiting periods, the waiting-period collection is `not_found`. It is not a grid of zeros.
 
@@ -103,16 +110,17 @@ A crown is not Major, and a procedure is not moved into a class, unless the docu
 
 ## Limitations
 
-- A PDF is rendered to page images with `pdftoppm`, then Tesseract reads those images. The PDF text layer is not used. This is OCR, not a vision LLM. If a field is not in the OCR text, it stays `not_found`.
-- If rendering or Tesseract fails, the process exits non-zero with an error JSON and no guessed benefits. If OCR returns no text, benefits stay `not_found` and a warning is included.
-- OCR can misread a column, a percent, or a dollar amount. Wrapped lines can split an age or a frequency away from its procedure. Those leaves stay `not_found` instead of being inferred.
-- Ambiguous rows (percent count does not match the network columns) are skipped.
+- OCR is removed. A PDF is rendered to page images with `pdftoppm`. Gemini is the intended reader. Calls stay off (`CALLS_ENABLED = False`) until `GEMINI_API_KEY` is confirmed, so a PDF run does not return plan fields.
+- If rendering fails, the process exits non-zero with an error JSON and no guessed benefits.
+- Text extraction still skips ambiguous rows (percent count does not match the network columns) instead of inferring them.
 - This tool does not import or depend on `/workspace/taigadesk/`.
 
 ## Hosted page
 
 A browser page is published with GitHub Pages: <https://jonnyjenqtaigadesk.github.io/dental-extractor/>.
 
-Paste a summary or upload a `.txt` or `.pdf` file. The page loads this repo's `extract.py` from the same site and runs the unchanged `extract_text` function in the browser with Pyodide. It does not rewrite the parser.
+Paste a summary or upload a `.txt` or `.pdf` file. Pasted text and a `.txt` upload load this repo's `extract.py` from the same site and run `extract_text` in the browser with Pyodide. They do not use PDF.js.
 
-A PDF is rendered to page images first. Tesseract.js (pinned from a CDN) then reads those images. That is OCR, not a vision LLM, and it does not read the PDF text layer. The page shows the page images, the OCR text that was parsed, `readable_summary`, and the JSON. Pasted text and a `.txt` upload are not OCR'd and do not use PDF.js. There is no backend and no API key.
+A PDF is rendered with PDF.js `page.render`, and the page images stay on the page. OCR is removed. Gemini is not called from the browser. A public page cannot hold `GEMINI_API_KEY`. After the images render, the page says: "Pages rendered. Gemini is not called from this page, so no plan fields were extracted." The PDF JSON is `{"ok": false, "error": "vision model not confirmed", "source": {"kind": "pdf-images", "page_count": N, "provider": "gemini"}}`.
+
+On-page note: OCR removed. Images stay on the page. The vision call is not wired in the browser.
