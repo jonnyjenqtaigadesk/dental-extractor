@@ -11,7 +11,7 @@ const pagesEl = document.getElementById("pages");
 const PDFJS_URL = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.8.69/pdf.min.mjs";
 const PDFJS_WORKER = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.8.69/pdf.worker.min.mjs";
 
-const NOT_CALLED = "Pages rendered. Gemini is not called from this page, so no plan fields were extracted.";
+const NOT_CALLED = "Pages rendered. Gemini runs in the CLI, not in the browser, so no plan fields were extracted.";
 
 let pyodidePromise = null;
 let pdfjsPromise = null;
@@ -145,7 +145,7 @@ async function onRun() {
       const pageCount = await renderPdfPages(file);
       const payload = {
         ok: false,
-        error: "vision model not confirmed",
+        error: "Gemini runs in the CLI, not in the browser",
         source: {
           kind: "pdf-images",
           page_count: pageCount,
@@ -181,7 +181,7 @@ document.getElementById("clear-file").addEventListener("click", () => {
 });
 
 loadRuntime()
-  .then(() => setStatus("Ready. Paste or a .txt file runs extract_text in the browser. A PDF is rendered to images only. No plan fields are read from those images on this page."))
+  .then(() => setStatus("Ready. Paste or a .txt file runs extract_text in the browser. A PDF is rendered to images only. Gemini runs in the CLI, not in the browser."))
   .catch((error) => {
     const message = error && error.stack ? String(error.stack) : String(error);
     jsonOut.textContent = message;

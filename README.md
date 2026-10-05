@@ -2,7 +2,7 @@
 
 Local CLI for other agents. It reads a pasted text summary or a PDF and returns one JSON object. For pasted text, stdin, and `--text`, every benefit value is either quoted from that text or explicitly `not_found`. It does not invent numbers, percents, ages, waiting periods, class mappings, or yes/no answers.
 
-OCR is removed. A PDF is rendered to page images. Gemini is the intended reader of those images. Calls are off until `GEMINI_API_KEY` is confirmed. The public page does not contain the key. No pip installs. Python 3 standard library plus the `pdftoppm` binary from poppler.
+OCR is removed. A PDF is rendered to page images and those images are sent to Gemini. The CLI reads `GEMINI_API_KEY` from the environment at call time. The public page does not contain the key and does not call Gemini. No pip installs. Python 3 standard library plus the `pdftoppm` binary from poppler.
 
 ## How to run
 
@@ -23,13 +23,7 @@ A PDF is not read as text. Each page is rendered to a PNG:
 pdftoppm -png -r 200 <file.pdf> <prefix>
 ```
 
-Those images are prepared for Gemini (`GEMINI_MODEL`, currently `gemini-3.8-flash`) as inline `image/png` parts on `generateContent`. The request is built in code and is not sent. `CALLS_ENABLED` is `False` until the key is confirmed. After a successful render the process deletes the temp PNGs, prints this, and exits 2:
-
-```json
-{"ok": false, "error": "vision model not confirmed", "source": {"kind": "pdf-images", "name": "<path>", "page_count": 1, "provider": "gemini"}}
-```
-
-There are no benefit fields in that object. If rendering fails, the process exits non-zero and prints `{"ok": false, "error": "<render error>"}` with no benefits. If calls were enabled and `GEMINI_API_KEY` were missing, the result would be `{"ok": false, "error": "GEMINI_API_KEY is not set"}` and still no network call. The key is read only from the environment at call time, never from a file.
+Those images are sent to Gemini (`GEMINI_MODEL`, currently `gemini-3.8-flash`) as inline `image/png` parts on `generateContent`. `CALLS_ENABLED` is `True`. Temp PNGs are deleted before the request returns. A field is found only when the model returns a non-empty evidence string; otherwise it is forced to `not_found` with `value` null. `extract_text` is not run on the PDF or on the model prose. If rendering fails, the process prints `{"ok": false, "error": "<render error>"}` and no benefits. If `GEMINI_API_KEY` is missing, the result is `{"ok": false, "error": "GEMINI_API_KEY is not set"}` and there is no network call. The key is read only from the environment at call time, never from a file.
 
 Model id: `gemini-3.8-flash`. Doc: <https://ai.google.dev/gemini-api/docs/models/gemini-3.8-flash>. That page lists it as the current stable Flash model and says its inputs include images and its output is text. Image-generation Flash models are a different task, so they are not used. The same id is the image-understanding example on <https://ai.google.dev/gemini-api/docs/generate-content/image-understanding>.
 
@@ -49,7 +43,7 @@ or:
 
 For text inputs, `status: found` requires `evidence` to be an exact substring of the text passed to `extract_text`. If it cannot be quoted, the leaf is `not_found` and `value` is null. A number in `value` must appear in that quote. Words such as "eighty percent" are not rewritten as 80. An absent slot is empty. It is not filled from general dental knowledge, and it is not stored as `false`.
 
-For a PDF, the regex parser does not run. A Gemini field would be `found` only when the model returned a non-empty evidence string. Missing or blank evidence is forced to `not_found` with `value` null. That response parser is not executed while calls are off.
+For a PDF, the regex parser does not run. A Gemini field is `found` only when the model returned a non-empty evidence string. Missing or blank evidence is forced to `not_found` with `value` null.
 
 If the document waives the deductible for preventive only, the orthodontic waiver stays `not_found`. If it says orthodontics is for children only, adult eligibility stays `not_found` unless adult eligibility is also printed. If it never mentions waiting periods, the waiting-period collection is `not_found`. It is not a grid of zeros.
 
@@ -110,7 +104,7 @@ A crown is not Major, and a procedure is not moved into a class, unless the docu
 
 ## Limitations
 
-- OCR is removed. A PDF is rendered to page images with `pdftoppm`. Gemini is the intended reader. Calls stay off (`CALLS_ENABLED = False`) until `GEMINI_API_KEY` is confirmed, so a PDF run does not return plan fields.
+- OCR is removed. A PDF is rendered to page images with `pdftoppm`, then each image is sent to Gemini. `CALLS_ENABLED` is `True`. The public page does not make that call.
 - If rendering fails, the process exits non-zero with an error JSON and no guessed benefits.
 - Text extraction still skips ambiguous rows (percent count does not match the network columns) instead of inferring them.
 - This tool does not import or depend on `/workspace/taigadesk/`.
@@ -121,6 +115,6 @@ A browser page is published with GitHub Pages: <https://jonnyjenqtaigadesk.githu
 
 Paste a summary or upload a `.txt` or `.pdf` file. Pasted text and a `.txt` upload load this repo's `extract.py` from the same site and run `extract_text` in the browser with Pyodide. They do not use PDF.js.
 
-A PDF is rendered with PDF.js `page.render`, and the page images stay on the page. OCR is removed. Gemini is not called from the browser. A public page cannot hold `GEMINI_API_KEY`. After the images render, the page says: "Pages rendered. Gemini is not called from this page, so no plan fields were extracted." The PDF JSON is `{"ok": false, "error": "vision model not confirmed", "source": {"kind": "pdf-images", "page_count": N, "provider": "gemini"}}`.
+A PDF is rendered with PDF.js `page.render`, and the page images stay on the page. OCR is removed. Gemini is not called from the browser. A public page cannot hold `GEMINI_API_KEY`. After the images render, the page says: "Pages rendered. Gemini runs in the CLI, not in the browser, so no plan fields were extracted." The PDF JSON is `{"ok": false, "error": "Gemini runs in the CLI, not in the browser", "source": {"kind": "pdf-images", "page_count": N, "provider": "gemini"}}`.
 
-On-page note: OCR removed. Images stay on the page. The vision call is not wired in the browser.
+On-page note: OCR removed. Images stay on the page. Gemini runs in the CLI, not in the browser.

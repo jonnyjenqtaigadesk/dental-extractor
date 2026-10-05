@@ -262,11 +262,12 @@ class EvidenceTests(unittest.TestCase):
 
     def test_no_network_imports(self):
         source = (ROOT / "extract.py").read_text(encoding="utf-8")
-        for banned in ("urllib", "requests", "http.client", "socket", "pip ", "tesseract", "pdftotext"):
+        for banned in ("requests", "http.client", "socket", "pip ", "tesseract", "pdftotext"):
             self.assertNotIn(banned, source)
+        self.assertIn("urllib.request", source)
         self.assertIn("pdftoppm", source)
         self.assertIn("GEMINI_MODEL", source)
-        self.assertIn("CALLS_ENABLED = False", source)
+        self.assertIn("CALLS_ENABLED = True", source)
         self.assertIn("subprocess", source)
         self.assertIn(
             "quote the page verbatim in evidence, and if it is not printed, status not_found",
@@ -343,23 +344,11 @@ class CliTests(unittest.TestCase):
                 env=env,
             )
             after = set(Path(tempfile.gettempdir()).glob("dental-pdf-*"))
-            self.assertEqual(proc.returncode, 2, proc.stderr + proc.stdout)
+            self.assertEqual(proc.returncode, 1, proc.stderr + proc.stdout)
             self.assertFalse(marker.exists(), marker.read_text() if marker.exists() else "")
             self.assertEqual(after, before)
             payload = json.loads(proc.stdout)
-            self.assertEqual(
-                payload,
-                {
-                    "ok": False,
-                    "error": "vision model not confirmed",
-                    "source": {
-                        "kind": "pdf-images",
-                        "name": str(pdf_path),
-                        "page_count": 1,
-                        "provider": "gemini",
-                    },
-                },
-            )
+            self.assertEqual(payload, {"ok": False, "error": "GEMINI_API_KEY is not set"})
             self.assertNotIn("fields", payload)
 
     def test_bad_pdf_is_json_error(self):
@@ -536,7 +525,7 @@ class GeminiPrepTests(unittest.TestCase):
             with mock.patch.object(socket, "socket", no_network):
                 request = extract.build_gemini_request([b"png-bytes"])
             self.assertEqual(extract.GEMINI_MODEL, "gemini-3.8-flash")
-            self.assertFalse(extract.CALLS_ENABLED)
+            self.assertTrue(extract.CALLS_ENABLED)
             self.assertIn("/models/gemini-3.8-flash:generateContent", request["url"])
             self.assertEqual(request["headers"]["x-goog-api-key"], "x")
             self.assertEqual(request["headers"]["Content-Type"], "application/json")
@@ -546,6 +535,102 @@ class GeminiPrepTests(unittest.TestCase):
             self.assertEqual(image["mime_type"], "image/png")
             self.assertEqual(image["data"], "cG5nLWJ5dGVz")
             self.assertNotIn("fields", request)
+        finally:
+            os.environ.pop("GEMINI_API_KEY", None)
+            if previous is not None:
+                os.environ["GEMINI_API_KEY"] = previous
+
+
+
+    def test_pdf_uses_fake_gemini_response_not_extract_text(self):
+        import io
+        import urllib.request
+
+        previous = os.environ.pop("GEMINI_API_KEY", None)
+        os.environ["GEMINI_API_KEY"] = "x"
+        try:
+            body = json.dumps(
+                {
+                    "candidates": [
+                        {
+                            "content": {
+                                "parts": [
+                                    {
+                                        "text": json.dumps(
+                                            {
+                                                "fields": {
+                                                    "annual_or_contract_maximum": {
+                                                        "amount_per_person": {
+                                                            "status": "found",
+                                                            "value": "$1,500",
+                                                            "evidence": "Annual maximum $1,500 per person",
+                                                        },
+                                                        "period": {
+                                                            "status": "found",
+                                                            "value": "annual",
+                                                            "evidence": "",
+                                                        },
+                                                    },
+                                                    "plan_type": {
+                                                        "status": "found",
+                                                        "value": "PPO",
+                                                    },
+                                                }
+                                            }
+                                        )
+                                    }
+                                ]
+                            }
+                        }
+                    ]
+                }
+            ).encode("utf-8")
+
+            class FakeResponse:
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *args):
+                    return False
+
+                def read(self):
+                    return body
+
+            seen = {}
+
+            def fake_urlopen(req, timeout=0):
+                seen["url"] = req.full_url
+                seen["timeout"] = timeout
+                header = req.get_header("X-goog-api-key")
+                seen["header_is_placeholder"] = header == "x"
+                return FakeResponse()
+
+            lines = ["Annual maximum $1,500 per person"]
+            with tempfile.TemporaryDirectory() as tmp:
+                pdf_path = Path(tmp) / "sample.pdf"
+                pdf_path.write_bytes(build_pdf(lines))
+                with mock.patch.object(urllib.request, "urlopen", fake_urlopen):
+                    with mock.patch.object(extract, "extract_text", side_effect=AssertionError("extract_text")):
+                        buf = io.StringIO()
+                        with mock.patch.object(sys, "stdout", buf):
+                            code = extract.run([str(pdf_path)])
+            self.assertEqual(code, 0, buf.getvalue())
+            payload = json.loads(buf.getvalue())
+            self.assertTrue(payload["ok"])
+            self.assertNotIn("x-goog-api-key", buf.getvalue())
+            self.assertEqual(payload["source"]["kind"], "pdf-images")
+            self.assertEqual(payload["source"]["provider"], "gemini")
+            self.assertEqual(payload["source"]["page_count"], 1)
+            amount = payload["fields"]["annual_or_contract_maximum"]["amount_per_person"]
+            self.assertEqual(amount["status"], "found")
+            self.assertEqual(amount["value"], "$1,500")
+            self.assertEqual(amount["evidence"], "Annual maximum $1,500 per person")
+            period = payload["fields"]["annual_or_contract_maximum"]["period"]
+            self.assertEqual(period["status"], "not_found")
+            self.assertIsNone(period["value"])
+            self.assertEqual(payload["fields"]["plan_type"]["status"], "not_found")
+            self.assertIn("gemini-3.8-flash:generateContent", seen["url"])
+            self.assertTrue(seen["header_is_placeholder"])
         finally:
             os.environ.pop("GEMINI_API_KEY", None)
             if previous is not None:

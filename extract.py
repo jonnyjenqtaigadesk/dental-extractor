@@ -3,8 +3,8 @@
 
 Pure Python 3. Pasted text, stdin, and --text go through extract_text.
 A PDF is rendered to PNG page images with pdftoppm. Those images are
-prepared for Google Gemini and are not read by extract_text. Vision calls
-stay off until GEMINI_API_KEY is confirmed. Nothing is filled from general
+prepared for Google Gemini and are not read by extract_text. When
+GEMINI_API_KEY is set, those images are sent to Gemini. Nothing is filled from general
 dental knowledge.
 
 NADP class names (Class I / II / III) are NOT used as defaults.
@@ -813,11 +813,11 @@ def extract_text(text: str) -> dict[str, Any]:
 
 
 
-# Gemini vision. The request is built and not sent.
+# Gemini vision. Each rendered page image is sent when calls are enabled.
 # https://ai.google.dev/gemini-api/docs/models/gemini-3.8-flash
 # Current stable Flash model. Inputs include images. Output is text.
 # Image-generation Flash ids are a different task and are not used.
-CALLS_ENABLED = False
+CALLS_ENABLED = True
 GEMINI_MODEL = "gemini-3.8-flash"
 GEMINI_URL = (
     "https://generativelanguage.googleapis.com/v1beta/models/"
@@ -973,8 +973,14 @@ def parse_gemini_response(payload: Any) -> dict[str, Any]:
         if isinstance(payload.get("fields"), dict):
             return fields_from_gemini(payload)
         return skeleton()
+    raw_text = "\n".join(text_parts).strip()
+    if raw_text.startswith("```"):
+        raw_text = raw_text.split("\n", 1)[-1]
+        if raw_text.endswith("```"):
+            raw_text = raw_text[: raw_text.rfind("```")]
+        raw_text = raw_text.strip()
     try:
-        decoded = json.loads("\n".join(text_parts))
+        decoded = json.loads(raw_text)
     except json.JSONDecodeError:
         return skeleton()
     return fields_from_gemini(decoded)
@@ -1009,10 +1015,49 @@ def build_gemini_request(page_pngs: list[bytes]) -> dict[str, Any]:
     }
 
 
-def prepare_gemini_request(page_pngs: list[bytes]) -> dict[str, Any]:
-    """Return the unsent request, or an error if the key is missing.
+def redact_secret(message: str) -> str:
+    """Remove the API key from a message. Never log the key itself."""
+    try:
+        secret = os.environ["GEMINI_API_KEY"]
+    except KeyError:
+        return message
+    if secret:
+        return message.replace(secret, "[redacted]")
+    return message
 
-    This never contacts the network. A missing key does not fall through to a call.
+
+def execute_gemini_request(request: dict[str, Any]) -> tuple[Any, str | None]:
+    """POST the prepared generateContent request. The key stays in the header."""
+    import urllib.error
+    import urllib.request
+
+    data = json.dumps(request["body"]).encode("utf-8")
+    outgoing = urllib.request.Request(
+        request["url"],
+        data=data,
+        headers=dict(request["headers"]),
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(outgoing, timeout=180) as response:
+            raw = response.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        return None, redact_secret(f"gemini http {exc.code}: {detail}")
+    except urllib.error.URLError as exc:
+        return None, redact_secret(f"gemini request failed: {exc}")
+    except TimeoutError as exc:
+        return None, redact_secret(f"gemini request failed: {exc}")
+    try:
+        return json.loads(raw), None
+    except json.JSONDecodeError:
+        return None, "gemini response was not JSON"
+
+
+def prepare_gemini_request(page_pngs: list[bytes]) -> dict[str, Any]:
+    """Return the request, or an error if the key is missing.
+
+    A missing key does not fall through to a call.
     """
     try:
         if os.environ["GEMINI_API_KEY"] == "":
@@ -1089,9 +1134,34 @@ def run(argv: list[str] | None = None) -> int:
                 emit({"ok": False, "error": err})
                 return 1
             page_count = len(images or [])
-            blocked = {
-                "ok": False,
-                "error": "vision model not confirmed",
+            if not CALLS_ENABLED:
+                emit(
+                    {
+                        "ok": False,
+                        "error": "vision model not confirmed",
+                        "source": {
+                            "kind": "pdf-images",
+                            "name": args.file,
+                            "page_count": page_count,
+                            "provider": "gemini",
+                        },
+                    }
+                )
+                return 2
+            prepared = prepare_gemini_request(images or [])
+            if not prepared["ok"]:
+                emit({"ok": False, "error": prepared["error"]})
+                return 1
+            payload, call_err = execute_gemini_request(prepared["request"])
+            if call_err:
+                emit({"ok": False, "error": call_err})
+                return 1
+            fields = parse_gemini_response(payload)
+            result = {
+                "ok": True,
+                "fields": fields,
+                "notes": collect_notes(fields),
+                "readable_summary": build_summary(fields),
                 "source": {
                     "kind": "pdf-images",
                     "name": args.file,
@@ -1099,16 +1169,6 @@ def run(argv: list[str] | None = None) -> int:
                     "provider": "gemini",
                 },
             }
-            if not CALLS_ENABLED:
-                emit(blocked)
-                return 2
-            prepared = prepare_gemini_request(images or [])
-            if not prepared["ok"]:
-                emit({"ok": False, "error": prepared["error"]})
-                return 1
-            # The request in prepared["request"] is not executed.
-            emit(blocked)
-            return 2
         else:
             text = read_text_file(args.file)
             result = extract_text(text)
