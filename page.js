@@ -105,8 +105,9 @@ function formatValue(value) {
   }
   const printed = typeof value.printed === "string" && value.printed ? value.printed : "";
   const hasNormalized = value.normalized !== null && value.normalized !== undefined;
+  const unit = value.unit === "percent" || value.unit === "dollars" ? ", " + value.unit : "";
   if (printed && hasNormalized) {
-    return printed + " (normalized " + String(value.normalized) + ")";
+    return printed + " (normalized " + String(value.normalized) + unit + ")";
   }
   if (printed) {
     return printed;
@@ -151,8 +152,8 @@ function showRecords(records) {
     const plan = document.createElement("article");
     plan.className = "plan";
     addText(plan, "h3", "Plan " + (index + 1));
-    const usable = record && record.usable === true;
-    addText(plan, "p", "usable: " + (usable ? "true" : "false")).className = "meta";
+    const usable = record && (record.usable === "yes" || record.usable === "no") ? record.usable : "no";
+    addText(plan, "p", "usable: " + usable).className = "meta";
     if (record && typeof record.failure_reason === "string" && record.failure_reason) {
       addText(plan, "p", "failure_reason: " + record.failure_reason).className = "meta";
     }

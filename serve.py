@@ -126,7 +126,11 @@ def _sanitize_value(value: Any) -> dict[str, Any] | None:
         printed = None
     if isinstance(normalized, bool) or not isinstance(normalized, (int, float, type(None))):
         normalized = None
-    return {"printed": printed, "normalized": normalized}
+    cleaned = {"printed": printed, "normalized": normalized}
+    unit = value.get("unit")
+    if unit in ("percent", "dollars"):
+        cleaned["unit"] = unit
+    return cleaned
 
 
 def _sanitize_side(side: Any) -> dict[str, Any] | None:
@@ -287,7 +291,11 @@ def pdf_bytes_from_body(body: bytes, content_type: str) -> bytes | None:
 
 
 def extract_pdf_bytes(pdf_bytes: bytes) -> dict[str, Any]:
-    """Render pages, call the existing extract path, and return a browser payload."""
+    """Render pages, call the existing extract path, and return a browser payload.
+
+    Nothing here is reused from a previous PDF. Images and records are
+    locals of this call only.
+    """
     images: list[bytes] = []
     if not pdf_bytes or not pdf_bytes.startswith(b"%PDF"):
         return build_browser_response([extract.blank_record("upload is not a PDF")], [])

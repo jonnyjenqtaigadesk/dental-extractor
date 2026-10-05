@@ -24,16 +24,16 @@ A PDF is not read as text. Each page is rendered first:
 pdftoppm -png -r 200 <file.pdf> <prefix>
 ```
 
-Those PNGs are the only PDF input to Gemini. `--text` and stdin do not call Gemini. They return one record, `usable` false, every leaf `not_found`, and `failure_reason` `only a PDF page-image read can fill fields`. Exit status is non-zero only for a real failure (missing file, render failure, API failure), not for a successful read that is not usable.
+Those PNGs are the only PDF input to Gemini. `--text` and stdin do not call Gemini. They return one record, `usable` `no`, every leaf `not_found`, and `failure_reason` `only a PDF page-image read can fill fields`. Exit status is non-zero only for a real failure (missing file, render failure, API failure), not for a successful read that is not usable.
 
-On a Gemini failure, a render failure, or zero pages, `ok` is false and the payload is still one record: `usable` false, every leaf `not_found`, `failure_reason` set to the error with the key redacted.
+On a Gemini failure, a render failure, or zero pages, `ok` is false and the payload is still one record: `usable` `no`, every leaf `not_found`, `failure_reason` set to the error with the key redacted. A later PDF does not reuse that record.
 
 ## Record
 
 One record per named plan. In-network and out-of-network are fields, not separate plans. Unlabeled money columns are not a network split.
 
 ```text
-usable                          bool
+usable                          "yes" or "no"
 failure_reason                  string or null
 fields.carrier
 fields.plan_name
@@ -44,11 +44,14 @@ fields.deductible_family.in_network / out_of_network / unlabeled
 fields.deductible_unlabeled.in_network / out_of_network / unlabeled
 fields.preventive / basic / major / endodontics / periodontics / oral_surgery
     each .in_network / .out_of_network / .unlabeled
+    class values store unit "percent" or "dollars"
 fields.preventive_deductible_waived
-fields.ortho_lifetime_max
-fields.ortho_coinsurance_or_copay
+fields.ortho_lifetime_maximum
+fields.ortho_coinsurance_or_copay   unit "percent" or "dollars"
 fields.ortho_age_limit
-fields.waiting_period.basic / major / ortho
+fields.waiting_period_basic
+fields.waiting_period_major
+fields.waiting_period_ortho
 fields.out_of_network_basis
 ```
 
@@ -60,9 +63,9 @@ Every leaf is `found`, `not_found`, or `conflict`.
 - `not_found`: `value`, `page`, and `excerpt` are null. Silence is `not_found`, not "not covered".
 - `conflict`: `sides`, and each side has `value`, `page`, and `excerpt`. Neither side is dropped.
 
-`usable` is true only when carrier is `found` (not `conflict`), at least one annual-maximum slot is `found`, none of those three slots is `conflict`, and preventive, basic, and major each have at least one `found` slot and no `conflict` slot.
+`usable` is `"yes"` only when carrier is `found` (not `conflict`), a per-person annual maximum is `found`, none of those annual-maximum slots is `conflict`, and preventive, basic, and major each have at least one `found` slot and no `conflict` slot. Otherwise `usable` is `"no"`.
 
-The coercer, not a pixel guess, applies the benefit rules: class assignment only when the excerpt states the percent or copay or names a class whose percent is in that same excerpt; one unlabeled number stays unlabeled; an unlabeled 100/80/50 triple is preventive, basic, major on the unlabeled slots and a fourth number is ignored; two unlabeled triples conflict; member-pay percents are stored as plan-pay (`100` minus the member percent) with the member-pay wording left in the excerpt; a bare deductible is `deductible_unlabeled`; a family annual maximum does not fill the per-person annual maximum; lifetime non-ortho dollars fill neither; a class dollar is a copay; percent plus copay conflicts; waiting `none` or `waived` is `none`, not `0`; `100%` preventive does not set the waived flag; `child` with no age is not an age limit; `no age limit` stays a phrase.
+The coercer, not a pixel guess, applies the benefit rules: class assignment only when the excerpt states the percent or copay or names a class whose percent is in that same excerpt; one unlabeled number stays unlabeled; an unlabeled 100/80/50 triple is preventive, basic, major on the unlabeled slots and a fourth number is ignored; two unlabeled triples conflict; member-pay percents are stored as plan-pay (`100` minus the member percent) with the member-pay wording left in the excerpt; a bare deductible is `deductible_unlabeled`; a family annual maximum does not fill the per-person annual maximum; lifetime non-ortho dollars fill neither; a class dollar is a copay with unit `dollars` (a percent uses unit `percent`); percent plus copay conflicts; waiting `none` or `waived` is `none`, not `0`; `100%` preventive does not set the waived flag; a deductible that applies to preventive is `not waived`; `child` with no age is not an age limit; adult orthodontia and `no age limit` stay a phrase with a null normalized value. Per calendar year does not make an annual maximum a family maximum. `family` is only that word. Labels that put percents in a different order than preventive/basic/major conflict with that triple and keep both. Two or more plan objects with fewer than two printed plan names are one record. A carrier or plan type printed once is copied onto each named plan.
 
 ## Hosted page
 
